@@ -18,15 +18,16 @@ of the project: read it, then `README.md`, before changing anything.
 | M2 serial execution, hashing, state store, rebuild decision, `-t why/query/clean` | done (`fea7752`) |
 | M3 parallel scheduler, output capture, status line, `-k`, signals | done (`93d074e`) |
 | M4 depfiles, `always`, early cutoff, generated includes | done (`c2e7246`) |
-| M5 tasks with params, `needs`, CLI overrides, `-t tasks` | done (uncommitted until the owner says so) |
-| **M6**–M7 Makefile importer (`internal/makefile`, `-t import`, transparent mode) | **next** (M6); depends only on M1 |
+| M5 tasks with params, `needs`, CLI overrides, `-t tasks` | done (`ac23625`) |
+| M6 Makefile importer I (`internal/makefile`, `-t import`, transparent mode) | done (uncommitted until the owner says so) |
+| **M7** importer II: recursive make, delegation, FIFO jobserver, `-t import --check` | **next** |
 | M8 Windows, fd-pair/semaphore jobserver | **deferred by the owner** — Windows is not an objective now |
 | M9 tracing, CAS cache, `tool` attribute | optional |
 
 ## Owner's decisions and working preferences
 
 - Name `rmake`, build file `Rmakefile`; with no `Rmakefile` but a `Makefile`,
-  rmake will import the Makefile (M6). Simplicity of the language without
+  rmake imports the Makefile (transparent mode). Simplicity of the language without
   losing make's power is the guiding principle; no user functions or macros.
 - Windows is not a goal for now: keep Windows-only code behind build tags
   (`*_unix.go` / `*_other.go` stubs) and do not implement or test it.
@@ -59,6 +60,12 @@ internal/hash        Cache: SHA-256 + stat cache + racy-clean + in-run memo +
                      Prestat (concurrent stat); Compute (concurrent) + Put
 internal/execx       BaseEnv/Env filtering, Resolver (PATH cache, mutex), Run
                      (own process group, Interrupt cause → signal, KillAll)
+internal/makefile    GNU make importer: read.go (lines, continuations),
+                     expand.go (variables, flavors/origins, expansion,
+                     symbolic templates), funcs.go (make functions),
+                     makefile.go (statements, rules, Import), rules.go
+                     (built-ins, suffix rules, implicit rule search),
+                     lower.go (targets → rmake text)
 internal/sched       Builder: decide (key + reasons); build.go: parallel
                      scheduler (Build, makeNodes, run.loop/decide/start/
                      complete, worker `work`); progress.go: output/status
@@ -113,6 +120,18 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   errors for a missing include nobody produces. `Builder.Build` no longer
   prints "no work to do"; it sets `Builder.Worked` and main prints it, since
   a run may call Build twice.
+- **Importer** (`internal/makefile`, README §10): evaluates like GNU make,
+  then lowers each needed target to one concrete rmake rule/task; output is
+  rmake *text*, parsed and printed canonically (a parse failure there is an
+  importer bug). Errors inside evaluation use `m.fail` (panic with
+  `failure`, recovered in `Import`). `m.pos` must be set before anything
+  that can fail or note. Symbolic variables: `lowering.symbolic` decides
+  eligibility (`info` caches a global taint expansion); `ruleSym.variable`
+  marks use; `varTemplate` marks only whole-word refs. Variables keep make's
+  names (owner decision deviated from README's lowercase: documented in
+  §10.4). Transparent mode re-imports on every run with env, overrides,
+  goals and `$(shell)` allowed; any `Approx` note refuses the build.
+- **Task names** may contain `-` and `.` (`syntax.IsTaskName`).
 - **State log** is valid up to the first damaged record; the rest is cut off
   on the next append. Losing state is always safe (it only causes rebuilds).
   `state.Store` is not safe for concurrent use.
@@ -122,6 +141,9 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 ## Testing and measuring
 
 - `go test ./...`; end-to-end behaviour tests are in `cmd/rmake/build_test.go`,
+  `cmd/rmake/import_test.go` (importer differential tests over
+  `testdata/makefiles/`, see its README; needs GNU make), `cmd/rmake/m6_test.go`
+  (transparent C build with real cc, refusal, `-t import`, `include x.mk`),
   `cmd/rmake/m5_test.go` (tasks, precedence through the real environment),
   `cmd/rmake/m4_test.go` (depfiles with a fake `cc.sh` and with real `cc`
   when present, `always`, generated includes)
@@ -130,7 +152,8 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   without `-k`, SIGINT to a child rmake: `TestMain` makes the test binary act
   as rmake when `RMAKE_TEST_MAIN` is set).
 - Fuzz targets: `syntax.FuzzParse` (parse→format→parse idempotence),
-  `glob.FuzzMatch`, `state.FuzzDecode`, `depfile.FuzzParse`. Regression inputs live in
+  `glob.FuzzMatch`, `state.FuzzDecode`, `depfile.FuzzParse`,
+  `makefile.FuzzImport`. Regression inputs live in
   `testdata/fuzz/`.
 - Performance check (no-op goal < 100 ms): 10k files `src/fN.txt`, Rmakefile
   `rule build/%.txt from src/%.txt` + `run cp $in $out` and
@@ -153,8 +176,20 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   Load (34 ms) and decide/key hashing are the places to look.
 - `deps`/`depfile` are parsed and stored on `graph.Rule` but depfiles are not
   read yet (M4); `state.Rule.Discovered` and the key already support them.
-- Including Makefiles returns a "not implemented" error (M6); `-t import`
-  likewise.
+- Importer gaps (approximations or errors today): recursive `$(MAKE)`,
+  `vpath`/`VPATH`, `.ONESHELL`, `SHELL` set, `::` rules,
+  `.SECONDEXPANSION`, `.DEFAULT`, archive members, target-specific variable
+  inheritance into prerequisites. `$(wildcard)`, `patsubst` and conditionals
+  are resolved at import time (no symbolic `glob`/`if` yet); comments are
+  not carried over; `-t import --check` does not exist yet.
+- Transparent mode passes command-line overrides both to the importer and to
+  rmake's eval; harmless except that rmake's override replaces a make
+  `override X += …` result. Exported variables become `pass`; make's whole
+  environment is not passed to recipes.
+- The ICU corpus case is slow (~4 s): `$(shell icu-config …)` runs on every
+  expansion of a recursive variable, as in make. Without `icu-config` its
+  output would differ from a machine that has it; both make and rmake see
+  the same, so the test still compares like with like.
 - With `-n`, a run whose only work was rebuilding a generated include does
   not print "no work to do" even if the dry run itself lists nothing.
 - Variables defined in a generated fragment are local to it (README §5.5),
@@ -162,15 +197,16 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 - The README §5.7 example deliberately contains a duplicate-output case
   (`src/gen.c`), explained under the example; the tests use a copy without it.
 
-## Plan for M6 (next)
+## Plan for M7 (next)
 
-Makefile importer I (README §10, PLAN.md §5–6): new package
-`internal/makefile` (make lexer/parser/evaluator: variables, conditionals,
-includes, explicit/pattern/suffix/static-pattern rules, automatic variables,
-`.PHONY` → task, `-include *.d` → `deps gcc`, GNU built-in rules, common
-functions), emitting `syntax` AST so `syntax.Format` prints it. Wire up
-`-t import`, `include x.mk`/`Makefile` (eval.include currently errors) and
-transparent mode (`buildFile` in main: no Rmakefile but a Makefile).
-Acceptance: differential tests (`make -n -B` ≡ `rmake -n -B`) for a
-construct corpus and ≥ 3 real single-directory Makefiles; skip if `make` is
-absent. Large milestone: agree a scope cut with the owner first.
+Importer II (README §10.3 rows marked M7, §10.5, §10.6, §7.2): recursive make
+(`$(MAKE) -C dir`, `cd dir && $(MAKE)`) → `include dir/Makefile` with path
+rewriting (importer currently runs everything relative to one directory;
+needs a per-file directory and rewriting of targets/prereqs/recipes),
+delegation (`make -C dir target` as an `always` rule/task) when that import
+fails, the FIFO jobserver in `.rmake/` (rmake's scheduler draws from it),
+and `-t import --check` (reuse `makeCommands`/`rmakeCommands`/
+`compareCommands` from `cmd/rmake/import_test.go`, moved into a package).
+Acceptance: a recursive multi-directory project imports to one graph;
+nested `make -j` under delegation respects the budget. Also worth doing:
+`vpath` resolution and symbolic `glob` for `$(wildcard)`.

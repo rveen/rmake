@@ -195,7 +195,7 @@ include    = "include" path NL .
 default    = "default" target { target } NL .
 rule       = "rule" outpattern { outpattern } "from" { inpattern }
              [ "|" { inpattern } ] NL { rule_attr } .
-task       = "task" NAME [ "(" NAME { "," NAME } ")" ]
+task       = "task" TASKNAME [ "(" NAME { "," NAME } ")" ]
              [ "needs" target { target } ] NL { task_attr } .
 if         = "if" cond NL { statement } [ "else" NL { statement } ] "end" NL .
 cond       = word ( "==" | "!=" ) word | "defined" NAME .
@@ -213,6 +213,10 @@ task_attr  = INDENT ( "var" NAME ( "=" | "+=" ) value
 ```
 
 `from` with no inputs is allowed (`rule out/version.txt from` + `always`).
+
+`NAME` is a letter or `_` followed by letters, digits and `_`; a `TASKNAME`
+may also contain `-` and `.` after the first character (`clean-all`,
+`test.unit`), as make's phony targets often do.
 
 `if` cannot appear inside a rule or task block; use rule-local variables set
 from top-level `if`s instead.
@@ -519,6 +523,7 @@ flags:
   -B            treat every rule as out of date (with -n: list all commands)
   -v            verbose
   -t tool       run a tool instead of building (see below)
+  -allow-shell  -t import: run $(shell ...) at import time
 
 tools (-t):
   why TARGET     why TARGET would rebuild (or did last time): which input/flag/env changed
@@ -528,9 +533,9 @@ tools (-t):
   targets        list all file targets
   clean          delete outputs recorded in state (never anything else)
   fmt [FILE]     print FILE in canonical form
-  import [FILE]  convert a Makefile (default: Makefile) to Rmakefile syntax on stdout
-                   --allow-shell   evaluate $(shell ...) at import time
-                   --check         compare `make -n -B` with the imported build
+  import [FILE]  convert a Makefile (default: GNUmakefile, makefile, Makefile) to
+                 Rmakefile syntax on stdout (-allow-shell: evaluate $(shell ...));
+                 *(M7)* --check: compare `make -n -B` with the imported build
 ```
 
 Task arguments are positional: `rmake release 1.4.0`. A task's parameters
@@ -563,43 +568,112 @@ each phase to stderr; `RMAKE_CPUPROFILE=file` writes a Go CPU profile.
 
 ### 10.1 Entry points
 
-1. `rmake -t import [Makefile] > Rmakefile`: one-time conversion to a readable
-   build file. Every approximation is marked with a `# rmake: …` comment and
-   summarized on stderr.
-2. **Transparent mode**: `rmake` without an `Rmakefile` but with a `Makefile`
-   (or `include x.mk` from an Rmakefile) imports in memory and builds. If the
-   import needs any approximation, rmake refuses, prints the report and
-   suggests `-t import`.
+1. `rmake -t import [-allow-shell] [MAKEFILE] > Rmakefile`: one-time
+   conversion to a readable build file (default: `GNUmakefile`, `makefile` or
+   `Makefile`, in make's order). Every note and approximation is listed as a
+   `# rmake: file:line: …` comment at the top and the approximations are
+   summarized on stderr. `$(shell …)` and `!=` run at import time only with
+   `-allow-shell`; otherwise they are an error with file:line.
+2. **Transparent mode**: `rmake` without an `Rmakefile` but with a makefile
+   (or `-f Makefile`, or `include x.mk` from an Rmakefile) imports in memory
+   on every run and builds. It follows make: the environment and command-line
+   variables are seen at import time, the goals are `$(MAKECMDGOALS)`, and
+   `$(shell)` runs. If the import needs any approximation, rmake refuses
+   (exit 2), lists them and suggests `-t import`.
 
-The importer is a separate front end (`internal/makefile`). It produces the
-same AST as the rmake parser; the core language gains no make semantics.
+The importer is a separate front end (`internal/makefile`). Its output is
+rmake text, parsed by the normal parser (and printed in canonical form by
+`-t import`); the core language gains no make semantics.
 
 ### 10.2 Pipeline
 
 ```
-Makefile → make lexer/parser → make evaluator → lowering → rmake AST → printer | eval
+Makefile → make reader/evaluator → rule database → implicit rule search → lowering → rmake text → parser | printer
 ```
 
-- The lexer handles recipe tabs (and `.RECIPEPREFIX`), backslash continuation,
-  `define … endef`, comments, and escapes.
-- The evaluator implements `=`, `:=`, `::=`, `?=`, `+=`, `override`, `export`,
-  `ifeq/ifneq/ifdef/ifndef`, `include/-include/sinclude`, and the make
-  functions listed in §10.3.
-- Values are kept **symbolic** where possible (`CFLAGS = -O2 -Wall` becomes
-  `var cflags ?= -O2 -Wall`, still editable) and expanded **concretely** where
-  necessary (computed variable names, `foreach`, `call`, `eval`, `shell`). The
-  differential check (§10.6) decides: if the symbolic form diverges from make,
-  that variable is expanded concretely.
+- The reader handles recipe lines (tab, or `.RECIPEPREFIX`), rule context
+  (blank lines, comments and conditionals keep it; other statements end it),
+  backslash continuation (one space outside recipes; kept in recipes),
+  `define … endef`, comments and `\#`.
+- The evaluator is GNU make's: flavors (`=`, `:=`, `::=`, `:::=`, `?=`, `+=`,
+  `!=`), origins and precedence (default < environment < file < command line
+  < `override`), `export`/`unexport`/`undefine`/`private`, conditionals
+  including `else ifeq`, `include`/`-include`/`sinclude` (paths relative to
+  the directory make runs in), target- and pattern-specific variables, rule
+  lines expanded immediately, recipes expanded per target with the automatic
+  variables (`$@ $< $^ $+ $* $? $| $(@D) $(@F)` …), and the functions of §10.3.
+- Rules: explicit (several rule lines merge prerequisites; a later recipe
+  overrides with a note), static pattern, pattern (multi-target patterns are
+  one rule with several outputs), suffix (`.c.o:`, `.c:`, `.SUFFIXES`),
+  grouped `&:`, `.PHONY`, `.DEFAULT_GOAL`, cancelling pattern rules, and GNU
+  make's built-in C, C++, assembler, link, lex, yacc and `.sh` rules and
+  variables in make's search order.
+- Implicit rule search follows GNU make: rules whose target pattern matches
+  (directories stripped when the pattern has no `/`), match-anything rules
+  dropped when a specific rule matches or when chaining, shortest stem first,
+  pass 1 (prerequisites exist or are mentioned in the makefile), pass 2
+  (prerequisites made by chained rules; each rule once per chain).
+- **Lowering** turns every target reachable from the makefile's explicit
+  targets and goals into one concrete rmake rule or task; the result is exact
+  (§10.6) and stays readable:
+  - Global variables referenced in recipes stay symbolic: `$(CFLAGS)` becomes
+    `$CFLAGS` inside the `sh "…"` string. Inside quotes rmake joins a list
+    with spaces, which is exactly make's text substitution. A variable stays
+    symbolic only if its global value is its value for that target (no
+    target- or pattern-specific value for it or anything it references) and
+    does not depend on automatic variables or on `$(shell)`/`$(eval)`.
+    Variables that are not symbolic are expanded in place (recursively, so
+    `$(COMPILE.c)` keeps `$CC` and `$CFLAGS`); function calls are expanded
+    concretely.
+  - A variable definition keeps references that are whole words
+    (`var COMPILE_c ?= $CC $CFLAGS $CPPFLAGS $TARGET_ARCH -c`); others are
+    expanded. Definitions are emitted in dependency order. Only variables the
+    output uses are emitted.
+  - Variables whose value the environment can set at rmake run time (make
+    defaults such as `CC`, environment variables, `?=`, variables only
+    appended to) become `var X ?= default` (the value *without* the
+    environment) plus `var X += …`; rmake then reads the environment as make
+    does. Other definitions become `var X = …`; command-line values are
+    concrete.
+  - Automatic variables: `$@` → `$out` (one output), `$<` → `$in` when the
+    explicit inputs are just the first prerequisite, `$^`/`$+`/`$?` → `$in`
+    when the explicit inputs are all prerequisites; otherwise concrete.
+    A recipe that uses `$^`, `$+` or `$?` gets all prerequisites as explicit
+    inputs, else only the first; the rest are implicit inputs.
+  - Prerequisites: a `.PHONY` or recipe-less missing target among a rule's
+    prerequisites (the FORCE idiom, `all: a b` aggregates) makes the rule
+    `always` and its prerequisites are merged in; directory targets (a name
+    ending in `/`, an existing directory, or a recipe of only `mkdir`) are
+    dropped (rmake creates output directories); order-only prerequisites
+    become implicit inputs.
+  - Tasks: `.PHONY` targets, recipe-less targets that do not exist (`all:
+    prog`), well-known names (`clean`, `install`, `test`, …) and targets whose
+    recipe never names them (`$@` or the name) and that no rule needs. A
+    recipe-less target without prerequisites (FORCE) is emitted only when a
+    task or the default goal needs it.
+  - Recipe lines: one `sh` each; `@` and `+` are dropped, `-cmd` becomes
+    `(cmd) || true`; backslash-newline is removed (as the shell does; a note
+    if it occurs inside single quotes); a line expanding to several lines
+    (`define`) gives one command per line.
+  - A command with `-MD`/`-MMD` gives `deps gcc`, with `depfile` from `-MF`
+    or from `-o` (`build/x.o` → `build/x.d`); `-include` of `.d` files is then
+    dropped (a note if no command writes them).
+  - Exported variables become `pass` on every rule and task.
+  - Makefiles included from an Rmakefile (and `-t import x.mk`) also export
+    the makefile's own pattern rules as rmake pattern rules, since the
+    importer cannot know which targets the Rmakefile needs. They follow
+    rmake's semantics (instantiated for every existing first input; `%` does
+    not match `/`), which a note says.
 
 ### 10.3 Translation
 
 | make | rmake |
 |---|---|
-| `X = …`, `X := …` | `var x = …`; recursive `=` variables referencing later definitions are expanded at their point of use, with a note |
-| `X ?= …`, and variables make would take from the environment (`CC`, `CFLAGS`, …) | `var x ?= …` |
-| `X += …` | `var x += …` |
-| `override X = …` | `var x = …` with a note (rmake CLI values always win) |
-| `ifeq/ifneq/ifdef/ifndef … else … endif` | `if … else … end` when it depends on overridable variables; resolved statically otherwise |
+| `X = …`, `X := …` | `var X = …` with the final value (recursive variables keep whole-word references symbolic, in dependency order) |
+| `X ?= …`, and variables make would take from the environment (`CC`, `CFLAGS`, …) | `var X ?= …` (the value without the environment) |
+| `X += …` | `var X += …` for variables the environment can set; otherwise part of the final value |
+| `override X = …` | `var X = …` with its value; in transparent mode the import already applied the command line |
+| `ifeq/ifneq/ifdef/ifndef … else … endif` | resolved at import time, with a note when the condition reads a variable the environment or command line can set (transparent mode re-imports on every run, so it is exact there); *(later)* `if … else … end` |
 | `include f` | `include f` (imported recursively if it is a makefile) |
 | `-include $(DEPS)` of `.d` files, with `-MD`/`-MMD` in the compile flags | `deps gcc` (+ `depfile` if not `$out.d`) on the matching rules; the include is dropped |
 | `a: b c` + recipe | `rule a from b c` |
@@ -620,21 +694,28 @@ Makefile → make lexer/parser → make evaluator → lowering → rmake AST →
 | recipe lines | one `sh "…"` per line; `.ONESHELL` → a single `sh` |
 | `@cmd` | `cmd` |
 | `-cmd` | `sh "cmd \|\| true"` with a note |
-| `$(MAKE) -C dir [targets]`, `cd dir && $(MAKE)` | `include dir/Makefile` with root-relative path rewriting; if that import fails, delegation (§10.5) |
-| `$(wildcard p)` | `glob p` |
-| `$(patsubst a,b,$(x))`, `$(x:a=b)`, `$(addprefix p,$(x))`, `$(addsuffix s,$(x))`, `$(basename …)` | substitution reference |
+| `$(MAKE) -C dir [targets]`, `cd dir && $(MAKE)` | *(M7)* `include dir/Makefile` with root-relative path rewriting; if that import fails, delegation (§10.5). M6: an approximation |
+| `$(wildcard p)` | expanded at import time (transparent mode re-imports on every run); *(later)* `glob p` |
+| `$(patsubst a,b,$(x))`, `$(x:a=b)`, `$(addprefix p,$(x))`, `$(addsuffix s,$(x))`, `$(basename …)` | evaluated concretely; *(later)* substitution reference |
 | `filter`, `filter-out`, `notdir`, `dir`, `suffix`, `subst`, `sort`, `strip`, `word(s)`, `firstword`, `lastword`, `foreach`, `if`, `or`, `and`, `call`, `eval`, `origin`, `value` | evaluated concretely at import time |
 | `$(shell …)` | with `--allow-shell`: run at import time, result inlined with a comment; otherwise an error with file:line |
-| `vpath`, `VPATH` | resolved statically to concrete paths |
+| `vpath`, `VPATH` | *(later)* resolved statically to concrete paths; M6: an approximation |
 | `.DELETE_ON_ERROR`, `.SUFFIXES`, `.DEFAULT_GOAL`, `.SILENT`, `.NOTPARALLEL` | default goal → `default`; others ignored with a note (rmake already deletes outputs on error) |
-| `::` rules, `.SECONDEXPANSION`, `$(guile …)`, `load` | v1: error with location; or delegation |
+| `::` rules, `.SECONDEXPANSION`, `$(guile …)`, `$(file …)`, `load` | error with location; *(later)* delegation |
+| `.ONESHELL`, `SHELL`/`.SHELLFLAGS` set, `.DEFAULT`, `.IGNORE`, archive members `lib.a(m.o)` | approximation (rmake runs each line with `/bin/sh -c`) |
 
 ### 10.4 Output shape
 
-The printed `Rmakefile` keeps the Makefile's order: variables first, then
-rules and tasks, with original comments carried over. Make variable names are
-lowercased (`CFLAGS` → `cflags`) unless that collides; CLI overrides with the
-original upper-case spelling are accepted as aliases in transparent mode.
+A header comment and the notes, the variables (dependency order), `default`
+(the default goal), then rules and tasks in the makefile's order of
+definition, followed by rules from implicit rules in the order they were
+needed. Original comments are not carried over (yet).
+
+Variable names keep make's spelling (`CFLAGS`, not `cflags`), so that
+`rmake CFLAGS=-O0` and `CC=clang rmake` work as with make; `.` and `-` become
+`_` (`COMPILE.c` → `COMPILE_c`). A name that is still not an rmake name, or
+collides, or is reserved (`os`, `arch`, `builddir`, `in`, `out`, `stem`), is
+expanded instead. Task names may contain `-` and `.` (§5.2).
 
 ### 10.5 Delegation
 
@@ -645,6 +726,14 @@ outputs.
 
 ### 10.6 Verification
 
+Implemented: the differential test harness below (`TestImportDifferential`,
+corpus in `testdata/makefiles/`, see its README). `-t import --check` is
+M7. Known, accepted differences in `make -n` output: make deletes
+intermediate files (`rm x.c`; rmake keeps them) and runs `mkdir` for
+directory targets (rmake creates output directories itself). Lines with `+`
+or `$(MAKE)` are executed by `make -n` and cannot be compared.
+
+
 - `rmake -t import --check` runs `make -n -B <goal>` and `rmake -n -B <goal>`
   on the imported build and compares the multisets of commands (whitespace
   normalized). Differences are reported per command.
@@ -653,6 +742,15 @@ outputs.
   Makefiles (small C libraries, a LaTeX document, a code generator project, a
   recursive multi-directory project). Tests that need GNU make skip if it is
   absent.
+
+### 10.7 Semantic differences that remain
+
+- Recipes see rmake's filtered environment (§5.6) plus `pass`ed variables,
+  not make's whole environment.
+- Target-specific variables apply to the target's own recipe only; when make
+  would pass one on to a prerequisite's recipe, that is an approximation.
+- rmake keeps intermediate files and rebuilds on content changes, not
+  timestamps (`$?` is all inputs).
 
 ## 11. Go project layout
 
@@ -699,7 +797,7 @@ on M1 and can proceed in parallel with M2–M5.
 - Unit tests per package. Golden-file tests for parser output, printer output,
   importer output and error messages.
 - Fuzz tests: lexer/parser, printer round-trip, depfile parser, glob matcher,
-  make lexer.
+  make importer (`makefile.FuzzImport`).
 - Integration tests in temp directories. Use the test binary itself as a fake
   compiler (`TestMain` re-exec pattern) that copies inputs to outputs, writes
   depfiles, counts invocations. Real `cc`/`go`/`make` tests skip if the tool is absent.

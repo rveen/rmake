@@ -22,6 +22,7 @@ import (
 	"github.com/rveen/rmake/internal/execx"
 	"github.com/rveen/rmake/internal/graph"
 	"github.com/rveen/rmake/internal/hash"
+	"github.com/rveen/rmake/internal/makefile"
 	"github.com/rveen/rmake/internal/sched"
 	"github.com/rveen/rmake/internal/state"
 	"github.com/rveen/rmake/internal/syntax"
@@ -58,6 +59,7 @@ type options struct {
 	always  bool
 	verbose bool
 	tool    string
+	shell   bool
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -72,6 +74,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&o.always, "B", false, "treat every rule as out of date")
 	fs.BoolVar(&o.verbose, "v", false, "print every command before running it")
 	fs.StringVar(&o.tool, "t", "", "run `tool`: why, query, graph, tasks, targets, clean, fmt, import")
+	fs.BoolVar(&o.shell, "allow-shell", false, "-t import: run $(shell ...) at import time")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: rmake [flags] [name=value ...] [target|task [args...] ...]")
 		fs.PrintDefaults()
@@ -111,8 +114,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return toolFmt(o, rest, stdout, stderr)
 	}
 	if o.tool == "import" {
-		fmt.Fprintln(stderr, "rmake: -t import is not implemented yet (milestone M6)")
-		return exitUsage
+		return toolImport(o, overrides, rest, stdout, stderr)
 	}
 
 	file, err := buildFile(o.file)
@@ -146,7 +148,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}()
 
 	load := func() (*graph.Graph, error) {
-		return eval.Load(eval.Options{File: file, Overrides: overrides, LookupEnv: os.LookupEnv})
+		return eval.Load(eval.Options{File: file, Overrides: overrides, LookupEnv: os.LookupEnv,
+			Import: transparent(overrides, rest, stderr)})
 	}
 	g, err := load()
 	timing.mark("load build file")
@@ -495,8 +498,8 @@ func makeStyleFlags(args []string) []string {
 	return out
 }
 
-// buildFile picks the build file: -f, else Rmakefile, else (later) an
-// imported Makefile.
+// buildFile picks the build file: -f, else Rmakefile, else a makefile
+// (imported in transparent mode), in GNU make's order.
 func buildFile(f string) (string, error) {
 	if f != "" {
 		return f, nil
@@ -504,12 +507,87 @@ func buildFile(f string) (string, error) {
 	if _, err := os.Stat("Rmakefile"); err == nil {
 		return "Rmakefile", nil
 	}
+	if m := findMakefile(); m != "" {
+		return m, nil
+	}
+	return "", errors.New("no Rmakefile or Makefile found")
+}
+
+func findMakefile() string {
 	for _, m := range []string{"GNUmakefile", "makefile", "Makefile"} {
 		if _, err := os.Stat(m); err == nil {
-			return "", fmt.Errorf("no Rmakefile; importing %s is not implemented yet (milestone M6)", m)
+			return m
 		}
 	}
-	return "", errors.New("no Rmakefile found")
+	return ""
+}
+
+func joinOverrides(overrides map[string][]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range overrides {
+		out[k] = strings.Join(v, " ")
+	}
+	return out
+}
+
+// transparent returns the importer used for makefiles in a build
+// (transparent mode, README §10.1): make's semantics, so $(shell) runs; an
+// import that needs approximations is refused.
+func transparent(overrides map[string][]string, goals []string, stderr io.Writer) func(string, bool) ([]byte, error) {
+	return func(rel string, root bool) ([]byte, error) {
+		res, err := makefile.Import(makefile.Options{
+			File: rel, Dir: ".", Environ: os.Environ(), Overrides: joinOverrides(overrides),
+			Goals: goals, AllowShell: true, NoDefault: !root, Fragment: !root, Stderr: stderr,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if res.Approx() {
+			var b strings.Builder
+			fmt.Fprintf(&b, "%s cannot be imported exactly:", rel)
+			for _, n := range res.Notes {
+				if n.Approx {
+					fmt.Fprintf(&b, "\n  %s", n)
+				}
+			}
+			fmt.Fprintf(&b, "\nuse 'rmake -t import %s > Rmakefile' to convert it, then review the result", rel)
+			return nil, errors.New(b.String())
+		}
+		return res.Source, nil
+	}
+}
+
+// toolImport implements -t import [FILE].
+func toolImport(o options, overrides map[string][]string, args []string, stdout, stderr io.Writer) int {
+	file := o.file
+	if len(args) > 0 {
+		file = args[0]
+	}
+	if file == "" {
+		file = findMakefile()
+	}
+	if file == "" || len(args) > 1 {
+		fmt.Fprintln(stderr, "usage: rmake -t import [-allow-shell] [MAKEFILE]")
+		return exitUsage
+	}
+	res, err := makefile.Import(makefile.Options{
+		File: file, Dir: ".", Environ: os.Environ(), Overrides: joinOverrides(overrides),
+		AllowShell: o.shell, Stderr: stderr, Fragment: strings.HasSuffix(file, ".mk"),
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "rmake:", err)
+		return exitUsage
+	}
+	stdout.Write(res.Source)
+	approx := 0
+	for _, n := range res.Notes {
+		if n.Approx {
+			approx++
+			fmt.Fprintln(stderr, "rmake: approximation:", n)
+		}
+	}
+	fmt.Fprintf(stderr, "rmake: imported %s: %d note(s), %d approximation(s)\n", file, len(res.Notes), approx)
+	return exitOK
 }
 
 func cleanAll(ss []string) []string {

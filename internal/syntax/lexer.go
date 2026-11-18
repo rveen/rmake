@@ -143,6 +143,21 @@ func IsName(s string) bool {
 	return true
 }
 
+// IsTaskName reports whether s is a valid task name: like a variable name,
+// but '-' and '.' may also appear after the first character (clean-all,
+// test.unit), as in make's phony targets.
+func IsTaskName(s string) bool {
+	if s == "" || !isNameStart(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if !isNameChar(s[i]) && s[i] != '-' && s[i] != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 // lexRef lexes a reference starting at s[i] == '$'. `$$` yields a literal
 // part.
 func lexRef(file string, n int, s string, i int) (Part, int, error) {

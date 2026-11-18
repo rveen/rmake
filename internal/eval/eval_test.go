@@ -195,7 +195,7 @@ func TestErrors(t *testing.T) {
 		{"rule a* from b\n  run x\n", "output a* contains glob characters"},
 		{"rule a from b\n  depfile x\n  run x\n", "depfile requires deps"},
 		{"rule a from b\n  desc x\n  desc y\n  run x\n", "Rmakefile:3:3: duplicate desc"},
-		{"include sub/Makefile\n", "not implemented yet (milestone M6)"},
+		{"include sub/Makefile\n", "including makefiles needs the importer"},
 		{"include nope\n", "include nope: no such file"},
 		{"include Rmakefile\n", "include cycle: Rmakefile -> Rmakefile"},
 		{"task t\n  run echo $nope\n", "Rmakefile:2:12: undefined variable nope"},

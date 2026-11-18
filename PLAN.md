@@ -225,7 +225,7 @@ depends only on M1, so it can start in parallel with M2–M5.
 | **M3** ✅ | Parallel scheduler, output capture, status line, `-k`, signals | Interrupt leaves no partial outputs; `-j1` ≡ `-j16` |
 | **M4** ✅ | Depfiles, `always`, early cutoff, generated-include reload | Header change rebuilds only affected objects; identical output skips dependents; generated fragment is built then used |
 | **M5** ✅ | Tasks with params, `needs`, CLI overrides & precedence, `-t tasks` | `rmake release 1.0` works; tasks never cached |
-| **M6** | Importer I: make lexer/parser/evaluator, variables, conditionals, includes, explicit/pattern/suffix/static-pattern rules, automatic vars, `.PHONY`→task, `-include *.d`→`deps gcc`, GNU built-in rules, common functions; `-t import`, transparent `Makefile` mode | Differential tests pass for the construct corpus and ≥ 3 real single-directory Makefiles |
+| **M6** ✅ | Importer I: make lexer/parser/evaluator, variables, conditionals, includes, explicit/pattern/suffix/static-pattern rules, automatic vars, `.PHONY`→task, `-include *.d`→`deps gcc`, GNU built-in rules, common functions; `-t import`, transparent `Makefile` mode | Differential tests pass for the construct corpus and ≥ 3 real single-directory Makefiles |
 | **M7** | Importer II: recursive `$(MAKE) -C` → include, `--allow-shell`, delegation fallback + FIFO jobserver, `-t import --check` | A recursive multi-dir project imports to one graph; nested `make -j` under delegation respects the budget |
 | M8 (deferred) | Windows (`sh` required), fd-pair & semaphore jobserver | Not scheduled: Windows is not an objective for now |
 | M9 (opt.) | `--strict` access tracing (Linux), local CAS output cache, `tool` attribute hashing compiler binaries (open question 1) | — |

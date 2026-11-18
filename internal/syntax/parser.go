@@ -228,7 +228,7 @@ func (p *parser) parseTask(n Node, l *line) (Stmt, error) {
 	} else {
 		t.Name = head
 	}
-	if !IsName(t.Name) {
+	if !IsTaskName(t.Name) {
 		return nil, Errorf(ws[0].Pos, "invalid task name %q", t.Name)
 	}
 	rest := ws[k:]
