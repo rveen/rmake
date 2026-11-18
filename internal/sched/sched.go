@@ -55,6 +55,10 @@ type Builder struct {
 
 	// Ran counts commands started (for tests).
 	Ran int
+	// Worked is set when a Build ran a command or (dry run) would have.
+	Worked bool
+
+	root string // absolute Root, see absRoot
 }
 
 // RuleID is the identity of a rule in the state store: a hash of its sorted
@@ -261,6 +265,18 @@ func (b *Builder) abs(p string) string {
 		return p
 	}
 	return filepath.Join(b.Root, p)
+}
+
+// absRoot returns the absolute project root (computed once).
+func (b *Builder) absRoot() string {
+	if b.root == "" {
+		abs, err := filepath.Abs(b.Root)
+		if err != nil {
+			abs = b.Root
+		}
+		b.root = filepath.ToSlash(abs)
+	}
+	return b.root
 }
 
 func (b *Builder) removeOutputs(r *graph.Rule) {

@@ -16,9 +16,9 @@ of the project: read it, then `README.md`, before changing anything.
 | M0 spec, module | done (`f90bc3f`) |
 | M1 parser, printer, eval, graph, `-n`, `-t graph/targets/tasks/fmt` | done (`ed2cd70`) |
 | M2 serial execution, hashing, state store, rebuild decision, `-t why/query/clean` | done (`fea7752`) |
-| M3 parallel scheduler, output capture, status line, `-k`, signals | done (uncommitted until the owner says so) |
-| **M4** depfiles, `always`, early cutoff, generated includes | **next** (early cutoff and `always` already work) |
-| M5 tasks with params, `needs`, CLI overrides, `-t tasks` | mostly done already; verify against README §12 and close |
+| M3 parallel scheduler, output capture, status line, `-k`, signals | done (`93d074e`) |
+| M4 depfiles, `always`, early cutoff, generated includes | done (uncommitted until the owner says so) |
+| **M5** tasks with params, `needs`, CLI overrides, `-t tasks` | **next**: mostly done already; verify against README §12 and close |
 | M6–M7 Makefile importer (`internal/makefile`, `-t import`, transparent mode) | todo; depends only on M1 |
 | M8 Windows, fd-pair/semaphore jobserver | **deferred by the owner** — Windows is not an objective now |
 | M9 tracing, CAS cache, `tool` attribute | optional |
@@ -49,6 +49,7 @@ internal/syntax      lexer (line/word based), parser, AST with positions,
                      canonical printer (Format) used by -t fmt
 internal/eval        Load(Options) -> *graph.Graph: scopes, expansion,
                      includes, patterns, tasks, fixpoint over $builddir globs
+internal/depfile     Parse (make-format depfiles), Normalize (root-relative)
 internal/glob        Match (with **), Disk (walks the tree, skips hidden dirs
                      and $builddir)
 internal/graph       Rule, Task, Cmd, Graph: AddRule (duplicate outputs),
@@ -65,7 +66,9 @@ internal/sched       Builder: decide (key + reasons); build.go: parallel
 ```
 
 Flow of a build (`cmd/rmake/main.go`): parse flags → start `state.Open`
-in a goroutine → `eval.Load` → `Hash.Prestat(g.Files())` → `g.Plan(requests,
+in a goroutine → `eval.Load` → if `g.Generated`: `buildIncludes` (build them,
+reload once if changed; also for `-n` and tools except clean) →
+`Hash.Prestat(g.Files())` → `g.Plan(requests,
 Hash.Exists)` → `Builder.Build(ctx, steps)` (ctx cancelled by SIGINT/SIGTERM
 with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 
@@ -97,6 +100,16 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   immediately (not when a slot frees), which keeps the progress total
   accurate and up-to-date rules fast; the plan index is the priority, so
   `-j1` follows plan order and `-n` prints in plan order.
+- **Depfiles**: the worker reads, parses and deletes the depfile (whatever
+  the outcome); `complete` normalizes, drops declared inputs/outputs, hashes
+  the rest with `Hash.Hash` (missing → `missingHash`) and recomputes the key
+  with the new discovered set before `PutRule`. `decide` uses the previous
+  record's discovered set, so the two keys match on a no-op.
+- **Generated includes**: `eval` reads a missing include as empty and
+  `pass.finish` resolves `g.Generated` (includes that are rule outputs) or
+  errors for a missing include nobody produces. `Builder.Build` no longer
+  prints "no work to do"; it sets `Builder.Worked` and main prints it, since
+  a run may call Build twice.
 - **State log** is valid up to the first damaged record; the rest is cut off
   on the next append. Losing state is always safe (it only causes rebuilds).
   `state.Store` is not safe for concurrent use.
@@ -105,13 +118,15 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 
 ## Testing and measuring
 
-- `go test ./...`; end-to-end behaviour tests are in `cmd/rmake/build_test.go`
+- `go test ./...`; end-to-end behaviour tests are in `cmd/rmake/build_test.go`,
+  `cmd/rmake/m4_test.go` (depfiles with a fake `cc.sh` and with real `cc`
+  when present, `always`, generated includes)
   (rules append to `ran.log` so tests assert exactly which rules ran), and
   in `cmd/rmake/parallel_test.go` (`-j1` ≡ `-j16`, real parallelism, failure
   without `-k`, SIGINT to a child rmake: `TestMain` makes the test binary act
   as rmake when `RMAKE_TEST_MAIN` is set).
 - Fuzz targets: `syntax.FuzzParse` (parse→format→parse idempotence),
-  `glob.FuzzMatch`, `state.FuzzDecode`. Regression inputs live in
+  `glob.FuzzMatch`, `state.FuzzDecode`, `depfile.FuzzParse`. Regression inputs live in
   `testdata/fuzz/`.
 - Performance check (no-op goal < 100 ms): 10k files `src/fN.txt`, Rmakefile
   `rule build/%.txt from src/%.txt` + `run cp $in $out` and
@@ -134,37 +149,21 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   Load (34 ms) and decide/key hashing are the places to look.
 - `deps`/`depfile` are parsed and stored on `graph.Rule` but depfiles are not
   read yet (M4); `state.Rule.Discovered` and the key already support them.
-- Including a generated file and including Makefiles return "not implemented"
-  errors (M4, M6). `-t import` likewise.
+- Including Makefiles returns a "not implemented" error (M6); `-t import`
+  likewise.
+- With `-n`, a run whose only work was rebuilding a generated include does
+  not print "no work to do" even if the dry run itself lists nothing.
+- Variables defined in a generated fragment are local to it (README §5.5),
+  so fragments contribute rules and tasks, not settings for the parent.
 - Task `desc` is computed with placeholder arguments; for tasks with
   parameters the progress line falls back to `task NAME ARGS`. Better: have
   `Task.Expand` return the expanded desc.
 - The README §5.7 example deliberately contains a duplicate-output case
   (`src/gen.c`), explained under the example; the tests use a copy without it.
 
-## Plan for M4 (next)
+## Plan for M5 (next)
 
-See README §4.4 (depfiles) and §5.5 (generated includes) and PLAN.md. Depfile
-parsing belongs in its own small package with a fuzz target (README §13);
-`graph.Rule` already carries `deps`/`depfile` and `state.Rule.Discovered` is
-already part of the key. Read depfiles in `complete` (scheduler goroutine),
-before `PutRule`.
-
-## M3 plan (done, kept for reference)
-
-1. `sched.Build`: replace the serial loop with a ready-queue scheduler over
-   the plan: a step is ready when the steps producing its inputs (and needed
-   tasks) are done; run up to `-j` jobs in goroutines; keep `decide`, state
-   writes and hash-cache access on the scheduler goroutine (or add a mutex).
-   Respect early cutoff: a dependent is decided only after its inputs settle.
-2. Without `-k`: stop starting jobs after the first failure, wait for running
-   ones, exit 1. With `-k`: skip only dependents of failures (already the
-   semantics of the serial loop).
-3. `execx`: run each command in its own process group (`Setpgid`, in a
-   `_unix.go` file); on SIGINT/SIGTERM forward the signal to all groups, wait,
-   delete outputs of interrupted rules, flush the state, exit 130.
-4. Output: capture per job (done), print each job's block on completion;
-   on a TTY one overwritten status line `[done/total] desc`, otherwise one
-   line per started job; count only steps that actually run.
-5. Tests: `-j1` and `-j16` produce identical outputs; interrupt leaves no
-   partial outputs (send SIGINT to a child rmake process in a test).
+Most of M5 exists (tasks with parameters, `needs`, overrides, `-t tasks`).
+Verify against README §5 / §9 / §12 ("`rmake release 1.0` works; tasks never
+cached", CLI > environment > `?=` precedence test from §13), fill gaps, and
+fix the task `desc` loose end above (expand desc with the arguments).

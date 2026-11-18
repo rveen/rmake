@@ -145,15 +145,110 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 
-	g, err := eval.Load(eval.Options{File: file, Overrides: overrides, LookupEnv: os.LookupEnv})
+	load := func() (*graph.Graph, error) {
+		return eval.Load(eval.Options{File: file, Overrides: overrides, LookupEnv: os.LookupEnv})
+	}
+	g, err := load()
 	timing.mark("load build file")
 	if err != nil {
 		fmt.Fprintln(stderr, "rmake:", err)
 		return exitUsage
 	}
+	switch o.tool {
+	case "", "why", "query", "clean", "targets", "tasks", "graph":
+	default:
+		fmt.Fprintf(stderr, "rmake: unknown tool %q\n", o.tool)
+		return exitUsage
+	}
+
+	// The state store and builder; the tools that only look at the graph
+	// need them only for generated includes.
+	var b *sched.Builder
+	setup := func() error {
+		var st state.Store
+		var err error
+		if stateCh != nil {
+			so := <-stateCh
+			stateCh = nil
+			st, err = so.st, so.err
+		} else {
+			st, err = state.Open(".rmake")
+		}
+		timing.mark("open state")
+		if err != nil {
+			return err
+		}
+		b = &sched.Builder{
+			G:       g,
+			Store:   st,
+			Hash:    hash.New(".", st),
+			Res:     execx.NewResolver("."),
+			Root:    ".",
+			BaseEnv: execx.BaseEnv(os.Environ()),
+			Out:     stdout,
+			Verbose: o.verbose,
+			Force:   o.always,
+			Keep:    o.keep,
+			DryRun:  o.dry,
+			Jobs:    o.jobs,
+		}
+		if f, ok := stdout.(*os.File); ok && isTerminal(f) {
+			b.TTY = true
+			b.Width = termWidth(f.Fd())
+		}
+		return nil
+	}
+	defer func() {
+		if b != nil {
+			b.Store.Close()
+		}
+	}()
+	// finish flushes the state and maps a build error to an exit code.
+	finish := func(err error) int {
+		if ferr := b.Store.Flush(); ferr != nil && err == nil {
+			err = ferr
+		}
+		timing.mark("flush state")
+		switch {
+		case err == nil:
+			return exitOK
+		case errors.Is(err, sched.ErrFailed):
+			return exitFailure
+		case errors.Is(err, sched.ErrInterrupted):
+			fmt.Fprintln(stderr, "rmake: interrupted")
+			return exitInterrupted
+		default:
+			fmt.Fprintln(stderr, "rmake:", err)
+			return exitFailure
+		}
+	}
+	// Build generated includes first (README §5.5), also for -n and the
+	// tools, as make does; clean only removes recorded outputs.
+	if len(g.Generated) > 0 && o.tool != "clean" {
+		if err := setup(); err != nil {
+			fmt.Fprintln(stderr, "rmake:", err)
+			return exitFailure
+		}
+		if o.tool != "" {
+			b.Out = stderr // keep the tool's output clean
+		}
+		ctx, stop := interrupts()
+		g, err = buildIncludes(ctx, b, load)
+		stop()
+		b.Out = stdout
+		timing.mark("generated includes")
+		var le loadError
+		if errors.As(err, &le) {
+			fmt.Fprintln(stderr, "rmake:", le.err)
+			b.Store.Flush()
+			return exitUsage
+		}
+		if err != nil {
+			return finish(err)
+		}
+	}
 
 	switch o.tool {
-	case "", "why", "query", "clean":
 	case "targets":
 		for _, t := range g.Targets() {
 			fmt.Fprintln(stdout, t)
@@ -167,37 +262,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return exitUsage
 		}
 		return exitOK
-	default:
-		fmt.Fprintf(stderr, "rmake: unknown tool %q\n", o.tool)
-		return exitUsage
 	}
 
-	so := <-stateCh
-	stateCh = nil
-	st := so.st
-	timing.mark("open state")
-	if so.err != nil {
-		fmt.Fprintln(stderr, "rmake:", so.err)
-		return exitFailure
-	}
-	defer st.Close()
-	b := &sched.Builder{
-		G:       g,
-		Store:   st,
-		Hash:    hash.New(".", st),
-		Res:     execx.NewResolver("."),
-		Root:    ".",
-		BaseEnv: execx.BaseEnv(os.Environ()),
-		Out:     stdout,
-		Verbose: o.verbose,
-		Force:   o.always,
-		Keep:    o.keep,
-		DryRun:  o.dry,
-		Jobs:    o.jobs,
-	}
-	if f, ok := stdout.(*os.File); ok && isTerminal(f) {
-		b.TTY = true
-		b.Width = termWidth(f.Fd())
+	if b == nil {
+		if err := setup(); err != nil {
+			fmt.Fprintln(stderr, "rmake:", err)
+			return exitFailure
+		}
 	}
 	// Stat every file of the graph concurrently; planning and the rebuild
 	// decisions then use the results.
@@ -229,11 +300,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return exitFailure
 		}
 		fmt.Fprintf(stdout, "rmake: removed %d file(s)\n", n)
-		if err := st.Flush(); err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
-			return exitFailure
-		}
-		return exitOK
+		return finish(nil)
 	}
 
 	reqs, err := requests(g, rest)
@@ -251,22 +318,102 @@ func run(args []string, stdout, stderr io.Writer) int {
 	err = b.Build(ctx, steps)
 	stop()
 	timing.mark("build")
-	if ferr := st.Flush(); ferr != nil && err == nil {
-		err = ferr
+	if err == nil && !b.Worked {
+		fmt.Fprintln(stdout, "rmake: no work to do")
 	}
-	timing.mark("flush state")
-	switch {
-	case err == nil:
-		return exitOK
-	case errors.Is(err, sched.ErrFailed):
-		return exitFailure
-	case errors.Is(err, sched.ErrInterrupted):
-		fmt.Fprintln(stderr, "rmake: interrupted")
-		return exitInterrupted
-	default:
-		fmt.Fprintln(stderr, "rmake:", err)
-		return exitFailure
+	return finish(err)
+}
+
+// loadError is a build file error found while reloading after generated
+// includes were built (exit code 2).
+type loadError struct{ err error }
+
+func (e loadError) Error() string { return e.err.Error() }
+
+// buildIncludes builds the generated includes of b.G. If one changed, it
+// reloads the build file once and returns the new graph (also set as b.G).
+// Generated includes that appear only after the reload are built too, but
+// may not change: that would need another reload.
+func buildIncludes(ctx context.Context, b *sched.Builder, load func() (*graph.Graph, error)) (*graph.Graph, error) {
+	hashes := func(ps []string) (map[string]string, error) {
+		m := map[string]string{}
+		for _, p := range ps {
+			h, _, err := b.Hash.Hash(p)
+			if err != nil {
+				return nil, err
+			}
+			m[p] = h // "" if missing
+		}
+		return m, nil
 	}
+	build := func(g *graph.Graph, ps []string) (changed []string, err error) {
+		before, err := hashes(ps)
+		if err != nil {
+			return nil, err
+		}
+		reqs := make([]graph.Request, len(ps))
+		for i, p := range ps {
+			reqs[i] = graph.Request{Name: p}
+		}
+		steps, err := g.Plan(reqs, b.Hash.Exists)
+		if err != nil {
+			return nil, loadError{err}
+		}
+		// Generated includes are built for real, even with -n.
+		dry := b.DryRun
+		b.DryRun = false
+		err = b.Build(ctx, steps)
+		b.DryRun = dry
+		if err != nil {
+			return nil, err
+		}
+		after, err := hashes(ps)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range ps {
+			if after[p] == "" {
+				return nil, fmt.Errorf("generated include %s was not created", p)
+			}
+			if after[p] != before[p] {
+				changed = append(changed, p)
+			}
+		}
+		return changed, nil
+	}
+
+	g := b.G
+	changed, err := build(g, g.Generated)
+	if err != nil || len(changed) == 0 {
+		return g, err
+	}
+	g2, err := load()
+	if err != nil {
+		return nil, loadError{err}
+	}
+	b.G = g2
+	built := map[string]bool{}
+	for _, p := range g.Generated {
+		built[p] = true
+	}
+	var fresh []string
+	for _, p := range g2.Generated {
+		if !built[p] {
+			fresh = append(fresh, p)
+		}
+	}
+	if len(fresh) == 0 {
+		return g2, nil
+	}
+	changed, err = build(g2, fresh)
+	if err != nil {
+		return nil, err
+	}
+	if len(changed) > 0 {
+		return nil, loadError{fmt.Errorf("generated include %s changed after the build file was reloaded; "+
+			"a generated include may not depend on rules from another generated include", changed[0])}
+	}
+	return g2, nil
 }
 
 // interrupts returns a context that SIGINT or SIGTERM cancels with an

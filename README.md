@@ -115,6 +115,17 @@ run.
 - Paths are normalized: cleaned, and absolute paths inside the project root are
   made root-relative, so keys do not depend on where the project is checked out.
 - Missing discovered input on the next build means the rule must rerun (not an error).
+  It is then recorded as missing, so the following build does not rerun it again.
+- Prerequisites that are declared inputs or outputs of the rule are not
+  recorded again; directories and other non-files count as missing.
+- A depfile that the commands did not write means no discovered inputs (as in
+  Ninja); a depfile that does not parse fails the rule. The depfile is also
+  deleted when the rule fails or is interrupted.
+- Discovered inputs order nothing: a *generated* header must also be declared
+  as an input (`| gen/config.h`) so that it is built before the rules that
+  include it.
+- The depfile is read by the job that ran the commands; the discovered inputs
+  are hashed after the commands finished, and the recorded key includes them.
 - Sources that produce this format: gcc/clang `-MD -MF`, `rustc --emit=dep-info`,
   Cargo `.d` files, many generators.
 
@@ -314,9 +325,19 @@ first rule or include).
   the result.
 - Variables: an included file sees its parent's variables; its own definitions
   are local to it and files it includes.
-- **Generated includes**: if an included path is the output of a rule, rmake
-  builds that rule first (using the graph loaded so far), then reloads the
-  whole build file once. A second change during reload is an error.
+- **Generated includes**: if an included path is the output of a rule
+  (declared anywhere in the build), rmake builds it before using the graph:
+  1. Load the build; a generated include that does not exist yet reads as
+     empty. A missing include that no rule produces is an error.
+  2. Build the generated includes (with the rules of that load; up to date
+     ones run nothing). This happens for real even with `-n` and before
+     `-t why/query/targets/tasks/graph` (as make remakes makefiles); with a
+     tool the progress goes to stderr. `-t clean` builds nothing.
+  3. If any of them changed, reload the whole build once.
+  4. Generated includes that appear only in the reload (a fragment that
+     includes another generated fragment) are built too; if one of them
+     changes, that is an error (exit 2): one reload is all rmake does. The
+     next run has both fragments and works.
 - Commands always run with the project root as the working directory.
   `$in`/`$out` are root-relative.
 - One global graph and one global namespace for tasks and targets. There is no

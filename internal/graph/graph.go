@@ -87,6 +87,10 @@ type Graph struct {
 	Tasks    map[string]*Task
 	TaskList []*Task // declaration order
 	Defaults []string
+	// Generated lists included files that rules produce, in include order.
+	// They must be built (and the build file reloaded if they changed)
+	// before the graph is used; a missing one was read as empty.
+	Generated []string
 }
 
 // New returns an empty graph.

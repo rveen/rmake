@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rveen/rmake/internal/depfile"
 	"github.com/rveen/rmake/internal/execx"
 	"github.com/rveen/rmake/internal/graph"
 	"github.com/rveen/rmake/internal/hash"
@@ -57,6 +58,7 @@ type job struct {
 	ran    int          // commands started
 	err    error        // nil, ErrFailed (reported in out) or ErrInterrupted
 	hashes []hash.Entry // rules: output hashes
+	deps   []string     // rules with deps: prerequisites from the depfile
 	dur    time.Duration
 }
 
@@ -77,7 +79,8 @@ type run struct {
 }
 
 // Build runs the steps of a plan (dependencies first, as Plan returns them).
-// It returns ErrFailed after reporting failures, ErrInterrupted if ctx was
+// It sets Worked if anything ran (the caller reports "no work to do"). It
+// returns ErrFailed after reporting failures, ErrInterrupted if ctx was
 // cancelled, or another error for problems that stop the build.
 func (b *Builder) Build(ctx context.Context, steps []graph.Step) error {
 	// Stat every file the plan looks at concurrently; the decisions then
@@ -192,14 +195,14 @@ func (r *run) loop() error {
 		}
 	}
 	r.prog.end()
+	if r.worked {
+		b.Worked = true
+	}
 	switch {
 	case r.interrupted:
 		return ErrInterrupted
 	case r.failed:
 		return ErrFailed
-	}
-	if !r.worked {
-		fmt.Fprintln(b.Out, "rmake: no work to do")
 	}
 	return nil
 }
@@ -344,6 +347,15 @@ func (b *Builder) work(ctx context.Context, j *job) {
 	start := time.Now()
 	j.err = b.runCmds(ctx, j)
 	j.dur = time.Since(start)
+	if j.rule != nil && j.rule.Deps != "" {
+		// Read and delete the depfile, whatever the outcome.
+		deps, err := readDepfile(b.abs(j.rule.Depfile))
+		if err != nil && j.err == nil {
+			fmt.Fprintf(&j.out, "FAILED: %s\nrmake: %s: %v\n", j.what, j.rule.Pos, err)
+			j.err = ErrFailed
+		}
+		j.deps = deps
+	}
 	if j.err != nil || j.rule == nil {
 		return
 	}
@@ -432,6 +444,11 @@ func (r *run) complete(j *job) {
 		outHashes[e.Path()] = h
 	}
 	d := r.nodes[j.idx].d
+	if rule.Deps != "" {
+		// The key records the inputs the depfile names now.
+		d.parts.discovered = b.discovered(rule, j.deps)
+		d.key = d.parts.key()
+	}
 	reason := ""
 	if len(d.reasons) > 0 {
 		reason = d.reasons[0]
@@ -452,6 +469,54 @@ func (r *run) complete(j *job) {
 	})
 	r.prog.finish(j.n, j.desc, j.out.Bytes())
 	r.finish(j.idx, true)
+}
+
+// readDepfile reads, parses and removes a depfile. A missing depfile means
+// no discovered inputs (as in Ninja).
+func readDepfile(p string) ([]string, error) {
+	data, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	os.Remove(p)
+	deps, err := depfile.Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %v", p, err)
+	}
+	return deps, nil
+}
+
+// discovered hashes the prerequisites of a depfile, normalized, without the
+// rule's declared inputs and outputs (missing files get missingHash). It
+// returns nil if nothing remains.
+func (b *Builder) discovered(r *graph.Rule, deps []string) map[string]string {
+	if len(deps) == 0 {
+		return nil
+	}
+	declared := map[string]bool{}
+	for _, p := range append(r.Inputs(), r.Outs...) {
+		declared[p] = true
+	}
+	root := b.absRoot()
+	m := map[string]string{}
+	for _, p := range deps {
+		p = depfile.Normalize(p, root)
+		if declared[p] {
+			continue
+		}
+		h, ok, err := b.Hash.Hash(p)
+		if err != nil || !ok {
+			h = missingHash
+		}
+		m[p] = h
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 // intHeap is a min-heap of step indexes (plan order).
