@@ -56,3 +56,35 @@ func TestHashAndCache(t *testing.T) {
 		t.Errorf("missing: %v %v", ok, err)
 	}
 }
+
+func TestComputePut(t *testing.T) {
+	root := t.TempDir()
+	st := open(t)
+	c := New(root, st)
+	os.WriteFile(filepath.Join(root, "out"), []byte("one"), 0o644)
+	h1, _, _ := c.Hash("out")
+	// Rewritten behind the memo; Compute does not touch the cache ...
+	os.WriteFile(filepath.Join(root, "out"), []byte("two"), 0o644)
+	e, err := c.Compute("out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, _, _ := c.Hash("out"); h != h1 {
+		t.Error("Compute changed the cache")
+	}
+	// ... Put replaces the entry.
+	h2, ok := c.Put(e)
+	if !ok || h2 == h1 {
+		t.Errorf("put: %s %v", h2, ok)
+	}
+	if h, _, _ := c.Hash("out"); h != h2 {
+		t.Error("Put did not update the memo")
+	}
+	if f, ok := st.File("out"); !ok || f.Hash != h2 {
+		t.Error("Put did not update the store")
+	}
+	e, err = c.Compute("missing")
+	if _, ok := c.Put(e); err != nil || ok {
+		t.Errorf("missing: %v %v", ok, err)
+	}
+}

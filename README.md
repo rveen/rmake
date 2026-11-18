@@ -132,8 +132,16 @@ For `go build`, `cargo build` and similar, two options, both valid:
 - Before running a rule, create parent directories of its outputs. (This
   replaces make's order-only directory prerequisites.)
 - On command failure: delete the rule's outputs, write no record.
-- On SIGINT/SIGTERM: forward the signal to all running process groups, wait,
-  delete outputs of interrupted rules, flush the state store, exit 130.
+- On SIGINT/SIGTERM: start no new jobs, forward the signal to all running
+  process groups, wait, delete outputs of interrupted rules (and write no
+  record for them), flush the state store, print `rmake: interrupted`, exit
+  130. A process group still running 2 s after the signal (for instance a
+  process that was being forked when it came) is killed with SIGKILL; a
+  second SIGINT/SIGTERM kills all running groups at once. Rules that
+  finished before the signal keep their outputs and records.
+- After a command exits, rmake waits at most 10 s for its output to close (a
+  background process left running by the command may hold it open); then the
+  command fails.
 - A crash between command and record write is safe: the next run sees no record
   or a hash mismatch and rebuilds.
 
@@ -403,11 +411,22 @@ between blocks, comments preserved). The same printer produces the output of
 
 ### 7.1 Scheduler
 
-- Topological, parallel. Default `-j` = `runtime.NumCPU()`.
-- A rule becomes ready when all inputs are up to date. Compute its key; run or skip.
+- Topological, parallel. Default `-j` = `runtime.NumCPU()`; values below 1
+  mean 1.
+- A step (rule or task) becomes ready when every step producing its inputs
+  (or a task it needs) has finished. A ready rule is decided at once (key
+  computed; run or skip), without waiting for a job slot, so up-to-date
+  rules never queue behind running jobs. Steps decided to run wait for a
+  slot; among them the earliest in plan order starts first, so `-j1` runs
+  in plan order.
+- Decisions, hash-cache updates, state writes and output all happen on one
+  scheduler goroutine; workers only run commands, capture output and hash
+  the rule's outputs. Early cutoff follows: a dependent is decided only after
+  its inputs have been rebuilt and rehashed.
 - `-k`: keep going after failures (build everything not depending on a failed
   rule). Without `-k`: start no new jobs after the first failure, wait for
-  running jobs, exit 1.
+  running jobs (and record those that succeed), exit 1. Rules skipped because
+  an input failed print nothing.
 - Each command runs in its own process group (Unix; *(deferred)* job object on
   Windows) for clean signal delivery.
 
@@ -425,9 +444,19 @@ between blocks, comments preserved). The same printer produces the output of
 ### 7.3 Output
 
 - Capture stdout and stderr per job (combined, in order), print on completion
-  as one block with a header (`desc` or the command).
-- On a TTY: single status line `[done/total] desc`, overwritten in place. Not
-  on a TTY: one line per started job.
+  as one block with a header (`desc` or the command). A block always ends
+  with a newline.
+- The total counts the planned steps not yet known to be up to date: steps
+  decided up to date (or skipped after a failure) leave it, so after the build
+  it equals the number of steps that ran.
+- On a TTY (stdout is a character device and `TERM` is not `dumb`): a single
+  status line `[done/total] desc` (desc of the most recently started running
+  job, cut to the terminal width) is overwritten in place. Only jobs with
+  output print their `[n/total] desc` header and output, above the status
+  line. The last status line stays on screen.
+- Not on a TTY: one `[n/total] desc` line per job when it starts; its output
+  follows when it finishes, preceded by the header again if other lines came
+  in between.
 - On failure: print the full command, exit code, and captured output.
 - `-v`: print every command before running.
 
@@ -488,7 +517,7 @@ Exit codes: 0 ok, 1 build failure, 2 usage or build-file error, 130 interrupted.
 
 Output: one `[n/N] desc` line per rule that runs (`desc`, else the first
 command, shortened to 200 characters), followed by the command's captured
-output. A failure prints `FAILED: outputs`, the command, its output and the
+output (§7.3 for ordering under `-j` and the TTY status line). A failure prints `FAILED: outputs`, the command, its output and the
 exit status. `-n` prints `# outputs: reasons` and the commands of every rule
 that would run. When nothing runs: `rmake: no work to do`.
 

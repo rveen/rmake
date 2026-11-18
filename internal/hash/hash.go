@@ -24,7 +24,8 @@ import (
 // RacyWindow is the racy-clean interval.
 const RacyWindow = 2 * time.Second
 
-// Cache hashes files relative to a root directory.
+// Cache hashes files relative to a root directory. It is not safe for
+// concurrent use, except for Compute.
 type Cache struct {
 	root  string
 	store state.Store
@@ -93,6 +94,53 @@ func (c *Cache) Hash(p string) (h string, ok bool, err error) {
 	c.memo[p] = h
 	c.store.PutFile(state.File{Path: p, Size: m.size, Mtime: m.mtime, Ino: m.ino, Hash: h, Recorded: recorded})
 	return h, true, nil
+}
+
+// Entry is a freshly computed hash of one file, to be recorded with Put.
+type Entry struct {
+	file state.File
+	ok   bool // the file exists
+}
+
+// Path is the root-relative path of the entry's file.
+func (e Entry) Path() string { return e.file.Path }
+
+// Compute hashes the file at p without consulting or changing the cache. It
+// is safe for concurrent use (unlike every other method): parallel jobs
+// hash their outputs with it, and the scheduler records the results with
+// Put.
+func (c *Cache) Compute(p string) (Entry, error) {
+	fi, err := os.Stat(c.abs(p))
+	if errors.Is(err, fs.ErrNotExist) {
+		return Entry{file: state.File{Path: p}}, nil
+	}
+	if err != nil {
+		return Entry{}, err
+	}
+	if fi.IsDir() {
+		return Entry{file: state.File{Path: p}}, nil
+	}
+	recorded := c.now().UnixNano()
+	h, err := hashFile(c.abs(p))
+	if err != nil {
+		return Entry{}, err
+	}
+	return Entry{ok: true, file: state.File{Path: p, Size: fi.Size(), Mtime: fi.ModTime().UnixNano(),
+		Ino: inode(fi), Hash: h, Recorded: recorded}}, nil
+}
+
+// Put records an entry from Compute, replacing what is known about its
+// file, and returns the hash (ok is false if the file did not exist).
+func (c *Cache) Put(e Entry) (h string, ok bool) {
+	p := e.file.Path
+	c.Forget(p)
+	if !e.ok {
+		return "", false
+	}
+	c.Hashed++
+	c.memo[p] = e.file.Hash
+	c.store.PutFile(e.file)
+	return e.file.Hash, true
 }
 
 // Forget drops what is known about p in this run; call it before p is

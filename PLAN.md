@@ -222,7 +222,7 @@ depends only on M1, so it can start in parallel with M2–M5.
 | **M0** ✅ | Fix the spec: apply §1.2 / §3 to README, rename `bld`→`rmake`, `Buildfile`→`Rmakefile`, move importer out of non-goals. `go mod init` | README is self-consistent; example in §5.7 is correct on all OSes |
 | **M1** ✅ | Lexer, parser, AST **printer**, eval (incl. `?=`, `defined`, substitution refs, rule-local vars, `\|` implicit inputs, pattern fixpoint), graph, static checks; `-n`, `-t graph`, `-t targets`, `-t fmt` | Example loads; errors have file:line:col; parse→print→parse round-trips; parser fuzzed |
 | **M2** ✅ | Serial execution, hashing + stat cache, state store, rebuild decision, `-t why/query/clean` | No-op second build; flag change rebuilds; deleted/modified output rebuilds; touch-only runs nothing |
-| **M3** | Parallel scheduler, output capture, status line, `-k`, signals | Interrupt leaves no partial outputs; `-j1` ≡ `-j16` |
+| **M3** ✅ | Parallel scheduler, output capture, status line, `-k`, signals | Interrupt leaves no partial outputs; `-j1` ≡ `-j16` |
 | **M4** | Depfiles, `always`, early cutoff, generated-include reload | Header change rebuilds only affected objects; identical output skips dependents; generated fragment is built then used |
 | **M5** | Tasks with params, `needs`, CLI overrides & precedence, `-t tasks` | `rmake release 1.0` works; tasks never cached |
 | **M6** | Importer I: make lexer/parser/evaluator, variables, conditionals, includes, explicit/pattern/suffix/static-pattern rules, automatic vars, `.PHONY`→task, `-include *.d`→`deps gcc`, GNU built-in rules, common functions; `-t import`, transparent `Makefile` mode | Differential tests pass for the construct corpus and ≥ 3 real single-directory Makefiles |

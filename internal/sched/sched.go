@@ -1,9 +1,8 @@
 // Package sched decides which rules are out of date and runs them
-// (README §4.2, §7). M2 runs steps serially in plan order.
+// (README §4.2, §7).
 package sched
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -15,7 +14,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/rveen/rmake/internal/execx"
 	"github.com/rveen/rmake/internal/graph"
@@ -34,6 +32,10 @@ const maxHeader = 200
 // failures have already been reported.
 var ErrFailed = errors.New("build failed")
 
+// ErrInterrupted is returned by Build when its context was cancelled. Running
+// commands were stopped and the outputs of their rules deleted.
+var ErrInterrupted = errors.New("interrupted")
+
 // Builder runs a plan.
 type Builder struct {
 	G       *graph.Graph
@@ -47,6 +49,9 @@ type Builder struct {
 	Force   bool // -B: every rule is out of date
 	Keep    bool // -k: keep going after failures
 	DryRun  bool // -n: print what would run and why
+	Jobs    int  // -j: jobs run in parallel (values below 1 mean 1)
+	TTY     bool // Out is a terminal: show one status line, overwritten in place
+	Width   int  // terminal width for the status line (0: unknown)
 
 	// Ran counts commands started (for tests).
 	Ran int
@@ -249,231 +254,6 @@ func diffMaps(what string, was, now map[string]string) []string {
 		}
 	}
 	return out
-}
-
-// Build runs steps (in plan order). It returns ErrFailed after reporting
-// failures, or another error for problems that stop the build.
-func (b *Builder) Build(ctx context.Context, steps []graph.Step) error {
-	failed := map[string]bool{}     // outputs of failed or skipped rules
-	failedTask := map[string]bool{} // failed or skipped tasks
-	pending := map[string]bool{}    // dry run: outputs that would be rebuilt
-	anyFailed := false
-	worked := false
-	total := len(steps)
-
-	blocked := func(deps []string) string {
-		for _, d := range deps {
-			if failed[d] || failedTask[d] {
-				return d
-			}
-		}
-		return ""
-	}
-
-	// Stat every file the plan looks at concurrently; the decisions below
-	// then run without waiting on system calls one by one.
-	var paths []string
-	seen := map[string]bool{}
-	for _, s := range steps {
-		if s.Rule == nil {
-			continue
-		}
-		for _, p := range append(s.Rule.Inputs(), s.Rule.Outs...) {
-			if !seen[p] {
-				seen[p] = true
-				paths = append(paths, p)
-			}
-		}
-	}
-	b.Hash.Prestat(paths)
-
-	for i, s := range steps {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		n := i + 1
-		if s.Task != nil {
-			if blocked(s.Task.Needs) != "" {
-				failedTask[s.Task.Name] = true
-				continue
-			}
-			worked = true
-			if err := b.runTask(ctx, s, n, total); err != nil {
-				if !errors.Is(err, ErrFailed) {
-					return err
-				}
-				anyFailed = true
-				failedTask[s.Task.Name] = true
-				if !b.Keep {
-					return ErrFailed
-				}
-			}
-			continue
-		}
-		r := s.Rule
-		if blocked(r.Inputs()) != "" {
-			for _, o := range r.Outs {
-				failed[o] = true
-			}
-			continue
-		}
-		d, err := b.decide(r, pending)
-		if err != nil {
-			fmt.Fprintf(b.Out, "FAILED: %s\nrmake: %s: %v\n", strings.Join(r.Outs, " "), r.Pos, err)
-			anyFailed = true
-			for _, o := range r.Outs {
-				failed[o] = true
-			}
-			if !b.Keep {
-				return ErrFailed
-			}
-			continue
-		}
-		if len(d.reasons) == 0 {
-			continue
-		}
-		worked = true
-		if b.DryRun {
-			fmt.Fprintf(b.Out, "# %s: %s\n", strings.Join(r.Outs, " "), strings.Join(d.reasons, "; "))
-			for _, c := range r.Cmds {
-				fmt.Fprintln(b.Out, c.String())
-			}
-			for _, o := range r.Outs {
-				pending[o] = true
-			}
-			continue
-		}
-		if err := b.runRule(ctx, r, d, n, total); err != nil {
-			if !errors.Is(err, ErrFailed) {
-				return err
-			}
-			anyFailed = true
-			for _, o := range r.Outs {
-				failed[o] = true
-			}
-			if !b.Keep {
-				return ErrFailed
-			}
-		}
-	}
-	if anyFailed {
-		return ErrFailed
-	}
-	if !worked {
-		fmt.Fprintln(b.Out, "rmake: no work to do")
-	}
-	return nil
-}
-
-func (b *Builder) header(n, total int, desc string, cmds []graph.Cmd) {
-	if desc == "" && len(cmds) > 0 {
-		desc = cmds[0].String()
-		if len(desc) > maxHeader && !b.Verbose {
-			desc = desc[:maxHeader] + " ..."
-		}
-	}
-	fmt.Fprintf(b.Out, "[%d/%d] %s\n", n, total, desc)
-}
-
-// runCmds runs commands in sequence, printing their output. It reports a
-// failure and returns ErrFailed if one fails.
-func (b *Builder) runCmds(ctx context.Context, what string, cmds []graph.Cmd, env []string) error {
-	for _, c := range cmds {
-		if b.Verbose {
-			fmt.Fprintln(b.Out, c.String())
-		}
-		b.Ran++
-		res, err := execx.Run(ctx, b.Res, c, b.Root, env)
-		if err != nil {
-			fmt.Fprintf(b.Out, "FAILED: %s\n%s\n", what, c.String())
-			if len(res.Output) > 0 {
-				b.Out.Write(res.Output)
-				if res.Output[len(res.Output)-1] != '\n' {
-					fmt.Fprintln(b.Out)
-				}
-			}
-			fmt.Fprintf(b.Out, "rmake: %s: %v\n", c.Pos, err)
-			return ErrFailed
-		}
-		b.Out.Write(res.Output)
-	}
-	return nil
-}
-
-func (b *Builder) runTask(ctx context.Context, s graph.Step, n, total int) error {
-	cmds, env, err := s.Task.Expand(s.Args)
-	if err != nil {
-		return err
-	}
-	name := strings.Join(append([]string{s.Task.Name}, s.Args...), " ")
-	if b.DryRun {
-		fmt.Fprintf(b.Out, "# task %s: tasks always run\n", name)
-		for _, c := range cmds {
-			fmt.Fprintln(b.Out, c.String())
-		}
-		return nil
-	}
-	desc := s.Task.Desc
-	if desc != "" && len(s.Task.Params) > 0 {
-		desc = "" // the stored desc has placeholder arguments
-	}
-	if desc == "" {
-		desc = "task " + name
-	}
-	b.header(n, total, desc, nil)
-	return b.runCmds(ctx, "task "+name, cmds, execx.Env(b.BaseEnv, env))
-}
-
-func (b *Builder) runRule(ctx context.Context, r *graph.Rule, d decision, n, total int) error {
-	id := RuleID(r)
-	for _, o := range r.Outs {
-		b.Hash.Forget(o)
-		if err := os.MkdirAll(filepath.Dir(b.abs(o)), 0o755); err != nil {
-			return err
-		}
-	}
-	b.header(n, total, r.Desc, r.Cmds)
-	start := time.Now()
-	fail := func() error {
-		b.removeOutputs(r)
-		b.Store.DeleteRule(id)
-		return ErrFailed
-	}
-	if err := b.runCmds(ctx, strings.Join(r.Outs, " "), r.Cmds, execx.Env(b.BaseEnv, r.Env)); err != nil {
-		return fail()
-	}
-	outHashes := map[string]string{}
-	for _, o := range r.Outs {
-		b.Hash.Forget(o)
-		h, ok, err := b.Hash.Hash(o)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			fmt.Fprintf(b.Out, "FAILED: %s\nrmake: %s: the commands did not create %s\n", strings.Join(r.Outs, " "), r.Pos, o)
-			return fail()
-		}
-		outHashes[o] = h
-	}
-	reason := ""
-	if len(d.reasons) > 0 {
-		reason = d.reasons[0]
-	}
-	b.Store.PutRule(&state.Rule{
-		ID:         id,
-		Outs:       r.Outs,
-		Key:        d.key,
-		Cmds:       d.parts.cmds,
-		Tools:      d.parts.tools,
-		Env:        d.parts.env,
-		Inputs:     d.parts.inputs,
-		Discovered: d.parts.discovered,
-		OutHashes:  outHashes,
-		Duration:   time.Since(start).Milliseconds(),
-		Reason:     reason,
-		Time:       time.Now().UnixNano(),
-	})
-	return nil
 }
 
 func (b *Builder) abs(p string) string {

@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rveen/rmake/internal/graph"
 )
@@ -66,9 +68,10 @@ func Env(base []string, pass map[string]string) []string {
 }
 
 // Resolver resolves argv[0] to an absolute path, caching PATH lookups for the
-// duration of a run.
+// duration of a run. It is safe for concurrent use.
 type Resolver struct {
 	root  string
+	mu    sync.Mutex
 	cache map[string]resolved
 }
 
@@ -88,6 +91,8 @@ func (r *Resolver) Resolve(c graph.Cmd) (string, error) {
 	if !c.Shell {
 		name = c.Argv[0]
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if v, ok := r.cache[name]; ok {
 		return v.path, v.err
 	}
@@ -117,8 +122,27 @@ type Result struct {
 	ExitCode int    // -1 if the command could not be started or was killed
 }
 
-// Run runs c in dir with env. A command that a relative argv[0] names (like
-// ./build/app) is resolved against dir, not the current directory.
+// Interrupt is the cancellation cause (context.WithCancelCause) that asks Run
+// to deliver Signal to the command's process group. Any other cause kills
+// the group.
+type Interrupt struct{ Signal os.Signal }
+
+func (i Interrupt) Error() string { return "interrupted by " + i.Signal.String() }
+
+// KillDelay is how long a cancelled command's process group may take to
+// exit after the Interrupt signal before it is killed.
+var KillDelay = 2 * time.Second
+
+// WaitDelay is how long Run waits for a command's output after the command
+// exited or was cancelled, before it kills the command and stops waiting.
+// (A background process that keeps the output open would otherwise block
+// the build.)
+var WaitDelay = 10 * time.Second
+
+// Run runs c in dir with env, in a process group of its own. A command that
+// a relative argv[0] names (like ./build/app) is resolved against dir, not
+// the current directory. When ctx is cancelled the process group receives
+// the signal of an Interrupt cause, else SIGKILL.
 func Run(ctx context.Context, r *Resolver, c graph.Cmd, dir string, env []string) (Result, error) {
 	prog, err := r.Resolve(c)
 	if err != nil {
@@ -139,10 +163,17 @@ func Run(ctx context.Context, r *Resolver, c graph.Cmd, dir string, env []string
 	}
 	cmd.Dir = dir
 	cmd.Env = env
+	exited := ownGroup(ctx, cmd)
+	defer exited()
+	cmd.WaitDelay = WaitDelay
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	err = cmd.Run()
+	if err = cmd.Start(); err == nil {
+		track(cmd, true)
+		err = cmd.Wait()
+		track(cmd, false)
+	}
 	res := Result{Output: out.Bytes()}
 	var ee *exec.ExitError
 	switch {

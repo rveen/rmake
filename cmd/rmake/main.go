@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path"
 	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rveen/rmake/internal/eval"
@@ -27,9 +29,10 @@ import (
 
 // Exit codes (README §9).
 const (
-	exitOK      = 0
-	exitFailure = 1
-	exitUsage   = 2
+	exitOK          = 0
+	exitFailure     = 1
+	exitUsage       = 2
+	exitInterrupted = 130
 )
 
 func main() {
@@ -190,6 +193,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		Force:   o.always,
 		Keep:    o.keep,
 		DryRun:  o.dry,
+		Jobs:    o.jobs,
+	}
+	if f, ok := stdout.(*os.File); ok && isTerminal(f) {
+		b.TTY = true
+		b.Width = termWidth(f.Fd())
 	}
 	// Stat every file of the graph concurrently; planning and the rebuild
 	// decisions then use the results.
@@ -239,7 +247,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "rmake:", err)
 		return exitUsage
 	}
-	err = b.Build(context.Background(), steps)
+	ctx, stop := interrupts()
+	err = b.Build(ctx, steps)
+	stop()
 	timing.mark("build")
 	if ferr := st.Flush(); ferr != nil && err == nil {
 		err = ferr
@@ -250,10 +260,50 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	case errors.Is(err, sched.ErrFailed):
 		return exitFailure
+	case errors.Is(err, sched.ErrInterrupted):
+		fmt.Fprintln(stderr, "rmake: interrupted")
+		return exitInterrupted
 	default:
 		fmt.Fprintln(stderr, "rmake:", err)
 		return exitFailure
 	}
+}
+
+// interrupts returns a context that SIGINT or SIGTERM cancels with an
+// execx.Interrupt cause, so that running commands receive the same signal.
+// A second signal kills the running commands. stop releases the signals.
+func interrupts() (ctx context.Context, stop func()) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	quit := make(chan struct{})
+	go func() {
+		n := 0
+		for {
+			select {
+			case s := <-sigs:
+				if n++; n == 1 {
+					cancel(execx.Interrupt{Signal: s})
+				} else {
+					execx.KillAll()
+				}
+			case <-quit:
+				return
+			}
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(sigs)
+		close(quit)
+		cancel(nil)
+	}
+}
+
+// isTerminal reports whether f is a terminal that understands the status
+// line's control sequences.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0 && os.Getenv("TERM") != "dumb"
 }
 
 // timer prints phase durations to stderr when RMAKE_TIMING is set.

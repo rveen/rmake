@@ -166,7 +166,8 @@ rule all.txt from bad.txt good.txt
   sh "echo $out >> ran.log; cat $in > $out"
 `,
 	})
-	code, out, ran := p.build("all.txt")
+	// -j1: with more jobs, good.txt would already run when bad.txt fails.
+	code, out, ran := p.build("-j1", "all.txt")
 	if code != 1 || !reflect.DeepEqual(ran, []string{"bad.txt"}) {
 		t.Fatalf("exit %d, ran %q\n%s", code, ran, out)
 	}
