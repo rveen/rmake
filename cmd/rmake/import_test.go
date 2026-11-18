@@ -6,10 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"testing"
+
+	"github.com/rveen/rmake/internal/makefile"
 )
 
 // corpus is the importer's differential test corpus (README §10.6): each
@@ -71,8 +71,8 @@ func TestImportDifferential(t *testing.T) {
 					src, _ := imp.CombinedOutput()
 					t.Fatalf("rmake -n -B %s: %v\n%s%s\nimport:\n%s", g, err, rout.String(), rerr.String(), src)
 				}
-				want, got := makeCommands(mout.String()), rmakeCommands(rout.String())
-				if diff := compareCommands(want, got); diff != "" {
+				want, got := makefile.MakeCommands(mout.String()), makefile.RmakeCommands(rout.String())
+				if diff := makefile.CompareCommands(want, got); diff != "" {
 					imp := exec.Command(self, "-t", "import", "-allow-shell")
 					imp.Dir, imp.Env = run, append(testEnv(dir), "RMAKE_TEST_MAIN=1")
 					src, _ := imp.CombinedOutput()
@@ -103,90 +103,4 @@ func copyTree(t *testing.T, from, to string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-}
-
-var spaces = regexp.MustCompile(`[ \t]+`)
-
-func normCmd(s string) string {
-	s = strings.ReplaceAll(s, "\\\n", "")
-	return strings.TrimSpace(spaces.ReplaceAllString(s, " "))
-}
-
-// makeCommands splits make -n output into commands (joining continued
-// lines) and drops make's own messages.
-func makeCommands(out string) []string {
-	var cmds []string
-	var cur []string
-	for _, l := range strings.Split(out, "\n") {
-		cur = append(cur, l)
-		if strings.HasSuffix(l, "\\") {
-			continue
-		}
-		c := normCmd(strings.Join(cur, "\n"))
-		cur = nil
-		if c == "" || strings.HasPrefix(c, "make: ") || strings.HasPrefix(c, "make[") {
-			continue
-		}
-		cmds = append(cmds, c)
-	}
-	return cmds
-}
-
-// intermediateRm is how make deletes intermediate files.
-var intermediateRm = regexp.MustCompile(`^rm( [^-][^ ;|&]*)+$`)
-
-var ignoreErrors = regexp.MustCompile(`^\((.*)\) \|\| true$`)
-
-// rmakeCommands extracts the commands of rmake -n output.
-func rmakeCommands(out string) []string {
-	var cmds []string
-	for _, l := range strings.Split(out, "\n") {
-		if l == "" || strings.HasPrefix(l, "# ") || strings.HasPrefix(l, "rmake: ") {
-			continue
-		}
-		c := normCmd(l)
-		if m := ignoreErrors.FindStringSubmatch(c); m != nil {
-			c = normCmd(m[1])
-		}
-		cmds = append(cmds, c)
-	}
-	return cmds
-}
-
-// compareCommands compares multisets of commands. make-only "rm FILES" of
-// intermediate files and "mkdir" of directory targets are accepted: rmake
-// keeps intermediates and creates output directories itself.
-func compareCommands(want, got []string) string {
-	count := map[string]int{}
-	for _, c := range got {
-		count[c]++
-	}
-	var missing, extra []string
-	for _, c := range want {
-		if count[c] > 0 {
-			count[c]--
-			continue
-		}
-		if intermediateRm.MatchString(c) || strings.HasPrefix(c, "mkdir ") {
-			continue
-		}
-		missing = append(missing, c)
-	}
-	for c, n := range count {
-		for ; n > 0; n-- {
-			extra = append(extra, c)
-		}
-	}
-	sort.Strings(extra)
-	if len(missing) == 0 && len(extra) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	for _, c := range missing {
-		b.WriteString("  make only:  " + c + "\n")
-	}
-	for _, c := range extra {
-		b.WriteString("  rmake only: " + c + "\n")
-	}
-	return b.String()
 }

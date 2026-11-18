@@ -109,6 +109,8 @@ run.
 - Attribute `deps make` (alias `deps gcc`): after the command succeeds, read the
   depfile (default `$out.d` for the first output, override with `depfile PATH`),
   record all prerequisites as discovered inputs, then delete the depfile.
+  Relative paths in it are relative to the directory the commands ran in (the
+  root, or the rule's `dir`).
 - Format: make syntax. `target(s): prereq prereq \` with backslash-newline
   continuation, `\ ` for escaped spaces, `$$` for `$`. Multiple target lines
   allowed; union all prerequisites.
@@ -207,10 +209,23 @@ rule_attr  = INDENT ( "var" NAME ( "=" | "+=" ) value  # rule-local variable
                     | "depfile" path
                     | "pass" NAME { NAME }  # pass these vars to the child env and include them in the key
                     | "always"
-                    | "desc" word ) NL .
+                    | "desc" word
+                    | "dir" path ) NL .     # run the commands in this directory
 task_attr  = INDENT ( "var" NAME ( "=" | "+=" ) value
-                    | "run" { word } | "sh" word | "pass" NAME { NAME } | "desc" word ) NL .
+                    | "run" { word } | "sh" word | "pass" NAME { NAME } | "desc" word
+                    | "dir" path ) NL .
 ```
+
+`dir PATH` runs the rule's or task's commands in PATH instead of the project
+root, as `make -C PATH` would. PATH is rewritten like an input (relative to
+the build file's directory, so `dir .` in `sub/Rmakefile` is `sub`).
+`$in`, `$out` and all other paths stay root-relative, so inside such
+commands they usually need `..`; the importer uses `dir` for recursive makes
+(§10.3), whose recipes it expands concretely. Depfile *contents* are read
+relative to PATH (that is where the compiler ran); the `depfile` path itself
+is root-relative. `dir` is part of the rebuild key (only when set, so keys of
+rules without it are unchanged). Relative commands (`run ./tool`) are
+resolved against PATH.
 
 `from` with no inputs is allowed (`rule out/version.txt from` + `always`).
 
@@ -326,7 +341,8 @@ first rule or include).
   directory and rewritten to root-relative. Exceptions: absolute paths, and
   paths under `$builddir`, which is always root-relative (`$builddir/lib.a`
   in `sub/Rmakefile` is `build/lib.a`, not `sub/build/lib.a`). Command lines
-  and `depfile` are never rewritten: commands run at the root.
+  and `depfile` are never rewritten: commands run at the root (unless the rule
+  has `dir`, §5.2).
 - `include sub/Makefile` (any file named `Makefile`, `makefile`,
   `GNUmakefile` or ending in `.mk`) runs the importer on it (§10) and includes
   the result.
@@ -345,8 +361,8 @@ first rule or include).
      includes another generated fragment) are built too; if one of them
      changes, that is an error (exit 2): one reload is all rmake does. The
      next run has both fragments and works.
-- Commands always run with the project root as the working directory.
-  `$in`/`$out` are root-relative.
+- Commands run with the project root as the working directory, unless the
+  rule or task has `dir` (§5.2). `$in`/`$out` are root-relative.
 - One global graph and one global namespace for tasks and targets. There is no
   recursive invocation.
 
@@ -361,7 +377,7 @@ first rule or include).
 - Several `run`/`sh` lines run in sequence; the first failure stops the rule.
 - Child environment is filtered: `PATH`, `HOME`, `TMPDIR`, `TEMP`, `TMP`,
   `LANG`, `LC_*`, `TERM`, `SYSTEMROOT` (Windows), plus variables listed in
-  `pass` attributes, plus jobserver variables (§7.2). Only `pass`-listed values
+  `pass` attributes, plus `MAKEFLAGS` when the jobserver is active (§7.2). Only `pass`-listed values
   enter the key (the rest cannot influence it except through the expanded
   command lines, which are keyed anyway).
 
@@ -464,9 +480,16 @@ between blocks, comments preserved). The same printer produces the output of
 - rmake acts as a GNU make jobserver so nested `make`, `cargo`, `ninja` (with
   jobserver support) share the `-j` budget. This matters most for Makefile
   delegation (§10.5).
-- Unix: create a FIFO in `.rmake/`, pre-fill with `j-1` tokens, export
-  `MAKEFLAGS=" -j<j> --jobserver-auth=fifo:<path>"`. rmake's own scheduler
-  draws from the same tokens.
+- Unix (implemented, `internal/jobserver`): for a build with `-j` > 1 (not
+  `-n`, not tools), create the FIFO `.rmake/jobserver` (the state lock makes
+  the name unique), pre-fill it with `j-1` tokens and put
+  `MAKEFLAGS=" -j<j> --jobserver-auth=fifo:<abs path>"` in every command's
+  environment. GNU make 4.4 and later are clients; a nested make with its own
+  `-jN` leaves the jobserver (make's behaviour).
+- rmake's own scheduler draws from the same tokens: it has one implicit job
+  slot and takes a token (in the background) for each further job it wants to
+  run, returning tokens as soon as it does not need them, so that nested
+  makes can use them. The FIFO is removed at the end of the build.
 - Older clients using `--jobserver-auth=R,W` fd pairs: via `exec.Cmd.ExtraFiles` (M8, deferred).
 - *(deferred)* Windows: named semaphore (`--jobserver-auth=<name>`) (M8).
 
@@ -524,6 +547,7 @@ flags:
   -v            verbose
   -t tool       run a tool instead of building (see below)
   -allow-shell  -t import: run $(shell ...) at import time
+  -check        -t import: compare make -n -B with the imported build
 
 tools (-t):
   why TARGET     why TARGET would rebuild (or did last time): which input/flag/env changed
@@ -535,7 +559,7 @@ tools (-t):
   fmt [FILE]     print FILE in canonical form
   import [FILE]  convert a Makefile (default: GNUmakefile, makefile, Makefile) to
                  Rmakefile syntax on stdout (-allow-shell: evaluate $(shell ...));
-                 *(M7)* --check: compare `make -n -B` with the imported build
+                 -check [MAKEFILE] [GOAL...]: compare `make -n -B` with the imported build
 ```
 
 Task arguments are positional: `rmake release 1.4.0`. A task's parameters
@@ -694,7 +718,7 @@ Makefile → make reader/evaluator → rule database → implicit rule search �
 | recipe lines | one `sh "…"` per line; `.ONESHELL` → a single `sh` |
 | `@cmd` | `cmd` |
 | `-cmd` | `sh "cmd \|\| true"` with a note |
-| `$(MAKE) -C dir [targets]`, `cd dir && $(MAKE)` | *(M7)* `include dir/Makefile` with root-relative path rewriting; if that import fails, delegation (§10.5). M6: an approximation |
+| `$(MAKE) [-C dir] [-f file] [VAR=v…] [targets]`, `cd dir && $(MAKE) …` as a whole recipe line of a task | the sub-makefile is imported into the same graph (make's semantics: command-line and exported variables passed down) and the task needs its targets. Its rules and tasks run in its directory (`dir`), its paths become root-relative (`../lib/x.a` from `app/` is `lib/x.a`), its tasks are named `dir.name` (`lib.clean`), its variables are expanded. Where make orders two sub-makes (`app: lib`, consecutive lines) but nothing the second builds depends on a file the first builds, that is an approximation (rmake would run them in parallel). Otherwise: delegation (§10.5) |
 | `$(wildcard p)` | expanded at import time (transparent mode re-imports on every run); *(later)* `glob p` |
 | `$(patsubst a,b,$(x))`, `$(x:a=b)`, `$(addprefix p,$(x))`, `$(addsuffix s,$(x))`, `$(basename …)` | evaluated concretely; *(later)* substitution reference |
 | `filter`, `filter-out`, `notdir`, `dir`, `suffix`, `subst`, `sort`, `strip`, `word(s)`, `firstword`, `lastword`, `foreach`, `if`, `or`, `and`, `call`, `eval`, `origin`, `value` | evaluated concretely at import time |
@@ -719,19 +743,29 @@ expanded instead. Task names may contain `-` and `.` (§5.2).
 
 ### 10.5 Delegation
 
-For a target the importer cannot translate, it emits a rule (or task, if
-phony) that runs `make -C dir target` under the rmake jobserver, marked
-`always`, with a `# rmake: delegated` note. Early cutoff still applies to its
-outputs.
+A recipe line that runs `$(MAKE)` and that the importer does not fold into
+the graph (§10.3) is *delegated*: kept as a command that runs make, which
+then runs under rmake's jobserver (§7.2), with a `# rmake: … delegated to
+make (reason)` note. A rule with such a line gets `always` (make decides what
+is out of date); early cutoff still applies to its outputs. Delegation is
+exact, so it is not an approximation and transparent mode accepts it.
+Reasons: the line is not a single recursive make (a shell loop, a pipe, two
+commands), it is in the recipe of a file rule, an unknown make option, the
+sub-makefile does not exist or fails to import or needs an approximation,
+or a cycle of recursive makes.
 
 ### 10.6 Verification
 
-Implemented: the differential test harness below (`TestImportDifferential`,
-corpus in `testdata/makefiles/`, see its README). `-t import --check` is
-M7. Known, accepted differences in `make -n` output: make deletes
-intermediate files (`rm x.c`; rmake keeps them) and runs `mkdir` for
-directory targets (rmake creates output directories itself). Lines with `+`
-or `$(MAKE)` are executed by `make -n` and cannot be compared.
+Implemented: `rmake -t import -check [MAKEFILE] [GOAL...]` and the
+differential test harness (`TestImportDifferential`, corpus in
+`testdata/makefiles/`, see its README), sharing `makefile.MakeCommands`,
+`RmakeCommands` and `CompareCommands`. `-check` runs the imported build with
+its approximations (they are what it checks) and exits 1 on differences.
+Known, accepted differences in `make -n` output: make deletes intermediate
+files (`rm x.c`; rmake keeps them), runs `mkdir` for directory targets (rmake
+creates output directories itself) and prints its recursive `make` commands
+(rmake folds them into one graph). Lines with `+` are executed by `make -n`
+and cannot be compared; delegated sub-makes differ for the same reason.
 
 
 - `rmake -t import --check` runs `make -n -B <goal>` and `rmake -n -B <goal>`
@@ -751,6 +785,12 @@ or `$(MAKE)` are executed by `make -n` and cannot be compared.
   would pass one on to a prerequisite's recipe, that is an approximation.
 - rmake keeps intermediate files and rebuilds on content changes, not
   timestamps (`$?` is all inputs).
+- In a task whose recipe mixes commands and recursive makes, the recursive
+  makes (now `needs`) run before all of its commands (a note says so).
+- Sub-makes are concrete: `rmake CFLAGS=-O0` reaches them in transparent mode
+  (the import passes command-line variables down, as make does), but in an
+  Rmakefile written by `-t import` only the root makefile's variables are
+  symbolic.
 
 ## 11. Go project layout
 

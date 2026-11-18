@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"runtime"
@@ -22,6 +23,7 @@ import (
 	"github.com/rveen/rmake/internal/execx"
 	"github.com/rveen/rmake/internal/graph"
 	"github.com/rveen/rmake/internal/hash"
+	"github.com/rveen/rmake/internal/jobserver"
 	"github.com/rveen/rmake/internal/makefile"
 	"github.com/rveen/rmake/internal/sched"
 	"github.com/rveen/rmake/internal/state"
@@ -60,6 +62,7 @@ type options struct {
 	verbose bool
 	tool    string
 	shell   bool
+	check   bool
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -75,6 +78,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&o.verbose, "v", false, "print every command before running it")
 	fs.StringVar(&o.tool, "t", "", "run `tool`: why, query, graph, tasks, targets, clean, fmt, import")
 	fs.BoolVar(&o.shell, "allow-shell", false, "-t import: run $(shell ...) at import time")
+	fs.BoolVar(&o.check, "check", false, "-t import: compare make -n -B with the imported build")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: rmake [flags] [name=value ...] [target|task [args...] ...]")
 		fs.PrintDefaults()
@@ -167,6 +171,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// The state store and builder; the tools that only look at the graph
 	// need them only for generated includes.
 	var b *sched.Builder
+	closeJobserver := func() {}
 	setup := func() error {
 		var st state.Store
 		var err error
@@ -199,8 +204,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 			b.TTY = true
 			b.Width = termWidth(f.Fd())
 		}
+		// A jobserver shares the -j budget with nested makes (README §7.2).
+		if !o.dry && o.jobs > 1 && o.tool == "" {
+			if js, err := jobserver.New(".rmake", o.jobs); err == nil {
+				b.Tokens = js
+				b.BaseEnv = append(b.BaseEnv, "MAKEFLAGS="+js.MakeFlags())
+				closeJobserver = func() { js.Close() }
+			}
+		}
 		return nil
 	}
+	defer func() { closeJobserver() }()
 	defer func() {
 		if b != nil {
 			b.Store.Close()
@@ -542,7 +556,7 @@ func transparent(overrides map[string][]string, goals []string, stderr io.Writer
 		if err != nil {
 			return nil, err
 		}
-		if res.Approx() {
+		if res.Approx() && os.Getenv("RMAKE_IMPORT_APPROX") == "" {
 			var b strings.Builder
 			fmt.Fprintf(&b, "%s cannot be imported exactly:", rel)
 			for _, n := range res.Notes {
@@ -561,13 +575,19 @@ func transparent(overrides map[string][]string, goals []string, stderr io.Writer
 func toolImport(o options, overrides map[string][]string, args []string, stdout, stderr io.Writer) int {
 	file := o.file
 	if len(args) > 0 {
-		file = args[0]
+		if _, err := os.Stat(args[0]); err == nil || !o.check {
+			file, args = args[0], args[1:]
+		}
 	}
 	if file == "" {
 		file = findMakefile()
 	}
-	if file == "" || len(args) > 1 {
+	if o.check {
+		return toolImportCheck(file, overrides, args, stdout, stderr)
+	}
+	if file == "" || len(args) > 0 {
 		fmt.Fprintln(stderr, "usage: rmake -t import [-allow-shell] [MAKEFILE]")
+		fmt.Fprintln(stderr, "       rmake -t import -check [MAKEFILE] [GOAL...]")
 		return exitUsage
 	}
 	res, err := makefile.Import(makefile.Options{
@@ -587,6 +607,55 @@ func toolImport(o options, overrides map[string][]string, args []string, stdout,
 		}
 	}
 	fmt.Fprintf(stderr, "rmake: imported %s: %d note(s), %d approximation(s)\n", file, len(res.Notes), approx)
+	return exitOK
+}
+
+// toolImportCheck implements -t import -check: it compares the commands of
+// make -n -B and of rmake -n -B on the imported build (README §10.6).
+func toolImportCheck(file string, overrides map[string][]string, goals []string, stdout, stderr io.Writer) int {
+	if file == "" {
+		fmt.Fprintln(stderr, "rmake: no makefile found")
+		return exitUsage
+	}
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(stderr, "rmake:", err)
+		return exitFailure
+	}
+	var vars []string
+	for k, v := range overrides {
+		vars = append(vars, k+"="+strings.Join(v, " "))
+	}
+	sort.Strings(vars)
+	args := append(append([]string{"-n", "-B", "-f", file}, vars...), goals...)
+	runOut := func(name string, env []string) (string, error) {
+		cmd := exec.Command(name, args...)
+		cmd.Env = env
+		var out, errb strings.Builder
+		cmd.Stdout, cmd.Stderr = &out, &errb
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("%s -n -B: %v\n%s%s", name, err, out.String(), errb.String())
+		}
+		return out.String(), nil
+	}
+	mout, err := runOut("make", os.Environ())
+	if err != nil {
+		fmt.Fprintln(stderr, "rmake:", err)
+		return exitFailure
+	}
+	// The imported build, approximations included: they are what is
+	// being checked.
+	rout, err := runOut(self, append(os.Environ(), "RMAKE_IMPORT_APPROX=1"))
+	if err != nil {
+		fmt.Fprintln(stderr, "rmake:", err)
+		return exitFailure
+	}
+	want, got := makefile.MakeCommands(mout), makefile.RmakeCommands(rout)
+	if diff := makefile.CompareCommands(want, got); diff != "" {
+		fmt.Fprintf(stdout, "rmake: %s: the imported build differs from make:\n%s", file, diff)
+		return exitFailure
+	}
+	fmt.Fprintf(stdout, "rmake: %s: the imported build runs the same %d command(s) as make\n", file, len(got))
 	return exitOK
 }
 

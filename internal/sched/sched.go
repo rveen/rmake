@@ -52,6 +52,9 @@ type Builder struct {
 	Jobs    int  // -j: jobs run in parallel (values below 1 mean 1)
 	TTY     bool // Out is a terminal: show one status line, overwritten in place
 	Width   int  // terminal width for the status line (0: unknown)
+	// Tokens is the jobserver rmake shares with nested makes (nil: none;
+	// then Jobs limits the parallelism).
+	Tokens Tokens
 
 	// Ran counts commands started (for tests).
 	Ran int
@@ -59,6 +62,12 @@ type Builder struct {
 	Worked bool
 
 	root string // absolute Root, see absRoot
+}
+
+// Tokens is a GNU make jobserver as seen by a client.
+type Tokens interface {
+	Acquire() (byte, error) // blocks until a token is free
+	Release(byte)
 }
 
 // RuleID is the identity of a rule in the state store: a hash of its sorted
@@ -72,6 +81,7 @@ func RuleID(r *graph.Rule) string {
 
 // parts are the components of a rule key.
 type parts struct {
+	dir        string // working directory, "" for the root
 	cmds       []string
 	tools      []string
 	env        map[string]string
@@ -101,6 +111,9 @@ func (p *parts) key() string {
 		h.Write(buf)
 	}
 	w("version", KeyVersion)
+	if p.dir != "" {
+		w("dir", p.dir) // only when set: keys of rules without dir are unchanged
+	}
 	for i, c := range p.cmds {
 		w("cmd", c, p.tools[i])
 	}
@@ -140,9 +153,10 @@ type decision struct {
 func (b *Builder) decide(r *graph.Rule, pending map[string]bool) (decision, error) {
 	var d decision
 	p := &d.parts
+	p.dir = r.Dir
 	for _, c := range r.Cmds {
 		p.cmds = append(p.cmds, keyCmd(c))
-		tool, err := b.Res.Resolve(c)
+		tool, err := b.Res.ResolveIn(c, b.abs(r.Dir))
 		if err != nil && !b.DryRun {
 			return d, err
 		}

@@ -247,8 +247,8 @@ func (p *parser) parseTask(n Node, l *line) (Stmt, error) {
 }
 
 var (
-	ruleAttrs = map[string]bool{"var": true, "run": true, "sh": true, "deps": true, "depfile": true, "pass": true, "always": true, "desc": true}
-	taskAttrs = map[string]bool{"var": true, "run": true, "sh": true, "pass": true, "desc": true}
+	ruleAttrs = map[string]bool{"var": true, "run": true, "sh": true, "deps": true, "depfile": true, "pass": true, "always": true, "desc": true, "dir": true}
+	taskAttrs = map[string]bool{"var": true, "run": true, "sh": true, "pass": true, "desc": true, "dir": true}
 )
 
 // attrs parses the attribute lines that follow header line h: lines indented
@@ -299,7 +299,7 @@ func checkAttr(a *Attr) error {
 				}
 			}
 		}
-	case "sh", "desc", "depfile":
+	case "sh", "desc", "depfile", "dir":
 		if n != 1 {
 			return Errorf(a.Pos, "%s takes exactly one word (quote it)", a.Kind)
 		}

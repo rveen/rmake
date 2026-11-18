@@ -58,6 +58,7 @@ type Rule struct {
 	Always   bool
 	Desc     string
 	Stem     string
+	Dir      string // commands run here (root-relative); "" is the root
 }
 
 // Name is the rule's display name: its first output.
@@ -75,9 +76,16 @@ type Task struct {
 	Params []string
 	Needs  []string // task names or root-relative file paths
 	Desc   string   // with placeholder arguments (<param>) for parameters
-	// Expand returns the commands, the pass'ed variables and the desc ("" if
-	// none) for the given arguments (one per parameter).
-	Expand func(args []string) (cmds []Cmd, env map[string]string, desc string, err error)
+	// Expand expands the task for the given arguments (one per parameter).
+	Expand func(args []string) (TaskRun, error)
+}
+
+// TaskRun is a task expanded with its arguments.
+type TaskRun struct {
+	Cmds []Cmd
+	Env  map[string]string // pass'ed variables
+	Desc string            // "" if none
+	Dir  string            // commands run here (root-relative); "" is the root
 }
 
 // Graph is the whole build.

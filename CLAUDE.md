@@ -19,10 +19,10 @@ of the project: read it, then `README.md`, before changing anything.
 | M3 parallel scheduler, output capture, status line, `-k`, signals | done (`93d074e`) |
 | M4 depfiles, `always`, early cutoff, generated includes | done (`c2e7246`) |
 | M5 tasks with params, `needs`, CLI overrides, `-t tasks` | done (`ac23625`) |
-| M6 Makefile importer I (`internal/makefile`, `-t import`, transparent mode) | done (uncommitted until the owner says so) |
-| **M7** importer II: recursive make, delegation, FIFO jobserver, `-t import --check` | **next** |
+| M6 Makefile importer I (`internal/makefile`, `-t import`, transparent mode) | done (`1ee2b5f`) |
+| M7 importer II: recursive make, delegation, FIFO jobserver, `-t import --check`, `dir` attribute | done (uncommitted until the owner says so) |
 | M8 Windows, fd-pair/semaphore jobserver | **deferred by the owner** — Windows is not an objective now |
-| M9 tracing, CAS cache, `tool` attribute | optional |
+| M9 tracing, CAS cache, `tool` attribute | optional; **ask the owner what is next** (see "Possible next steps") |
 
 ## Owner's decisions and working preferences
 
@@ -58,14 +58,18 @@ internal/graph       Rule, Task, Cmd, Graph: AddRule (duplicate outputs),
 internal/state       Store interface; binary log in .rmake/log (codec.go), flock
 internal/hash        Cache: SHA-256 + stat cache + racy-clean + in-run memo +
                      Prestat (concurrent stat); Compute (concurrent) + Put
-internal/execx       BaseEnv/Env filtering, Resolver (PATH cache, mutex), Run
+internal/jobserver   GNU make FIFO jobserver server (.rmake/jobserver)
+internal/execx       BaseEnv/Env filtering, Resolver (PATH cache, mutex,
+                     ResolveIn for dir), Run
                      (own process group, Interrupt cause → signal, KillAll)
 internal/makefile    GNU make importer: read.go (lines, continuations),
                      expand.go (variables, flavors/origins, expansion,
                      symbolic templates), funcs.go (make functions),
                      makefile.go (statements, rules, Import), rules.go
                      (built-ins, suffix rules, implicit rule search),
-                     lower.go (targets → rmake text)
+                     lower.go (targets → rmake text), submake.go
+                     (recursive make, delegation, order check), check.go
+                     (make -n vs rmake -n comparison, -t import -check)
 internal/sched       Builder: decide (key + reasons); build.go: parallel
                      scheduler (Build, makeNodes, run.loop/decide/start/
                      complete, worker `work`); progress.go: output/status
@@ -132,6 +136,27 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   §10.4). Transparent mode re-imports on every run with env, overrides,
   goals and `$(shell)` allowed; any `Approx` note refuses the build.
 - **Task names** may contain `-` and `.` (`syntax.IsTaskName`).
+- **`dir` attribute** (rules and tasks, `graph.Rule.Dir`, `graph.TaskRun.Dir`):
+  commands run in `b.abs(dir)`; depfile contents are joined with `Dir` before
+  `depfile.Normalize`; the key gets a "dir" entry only when set (no
+  KeyVersion bump). `Task.Expand` returns a `graph.TaskRun`.
+- **Jobserver** (`Builder.Tokens`, `run.loop`): with tokens, slots = 1 +
+  tokens held; one background Acquire at a time; tokens are released as soon
+  as running < slots, and all are returned (waiting for a pending Acquire) at
+  the end of every Build, because Build runs twice when generated includes
+  exist. main creates it only for real builds with -j > 1 and adds MAKEFLAGS
+  to BaseEnv.
+- **Sub-makes** (`internal/makefile/submake.go`): a `lowering` has a prefix
+  (root-relative dir), task prefix and `concrete` flag; the root lowering
+  owns `subs`/`subList`. `lowering.recursive` turns a whole-line recursive
+  make in a task into `subNeeds` via `root.invoke` → `importSub` (loads the
+  sub-makefile with overrides and exported variables, analyzes it, rolls back
+  and delegates if it fails or needs approximations). Everything else that
+  runs $(MAKE) is delegated (rules get `always`). `checkOrder` builds a key
+  graph ("f:path", "t:task") over all lowerings. Command-line goals are
+  visited after sub-makes are imported, and skipped if a lowering already
+  makes them (else a built-in rule at the root would duplicate a sub-make's
+  rule).
 - **State log** is valid up to the first damaged record; the rest is cut off
   on the next append. Losing state is always safe (it only causes rebuilds).
   `state.Store` is not safe for concurrent use.
@@ -144,6 +169,8 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   `cmd/rmake/import_test.go` (importer differential tests over
   `testdata/makefiles/`, see its README; needs GNU make), `cmd/rmake/m6_test.go`
   (transparent C build with real cc, refusal, `-t import`, `include x.mk`),
+  `cmd/rmake/m7_test.go` (jobserver budget with nested makes, recursive
+  project built with real cc, `-t import -check`),
   `cmd/rmake/m5_test.go` (tasks, precedence through the real environment),
   `cmd/rmake/m4_test.go` (depfiles with a fake `cc.sh` and with real `cc`
   when present, `always`, generated includes)
@@ -176,8 +203,7 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   Load (34 ms) and decide/key hashing are the places to look.
 - `deps`/`depfile` are parsed and stored on `graph.Rule` but depfiles are not
   read yet (M4); `state.Rule.Discovered` and the key already support them.
-- Importer gaps (approximations or errors today): recursive `$(MAKE)`,
-  `vpath`/`VPATH`, `.ONESHELL`, `SHELL` set, `::` rules,
+- Importer gaps (approximations or errors today): `vpath`/`VPATH`, `.ONESHELL`, `SHELL` set, `::` rules,
   `.SECONDEXPANSION`, `.DEFAULT`, archive members, target-specific variable
   inheritance into prerequisites. `$(wildcard)`, `patsubst` and conditionals
   are resolved at import time (no symbolic `glob`/`if` yet); comments are
@@ -197,16 +223,12 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 - The README §5.7 example deliberately contains a duplicate-output case
   (`src/gen.c`), explained under the example; the tests use a copy without it.
 
-## Plan for M7 (next)
+## Possible next steps (M7 done; ask the owner)
 
-Importer II (README §10.3 rows marked M7, §10.5, §10.6, §7.2): recursive make
-(`$(MAKE) -C dir`, `cd dir && $(MAKE)`) → `include dir/Makefile` with path
-rewriting (importer currently runs everything relative to one directory;
-needs a per-file directory and rewriting of targets/prereqs/recipes),
-delegation (`make -C dir target` as an `always` rule/task) when that import
-fails, the FIFO jobserver in `.rmake/` (rmake's scheduler draws from it),
-and `-t import --check` (reuse `makeCommands`/`rmakeCommands`/
-`compareCommands` from `cmd/rmake/import_test.go`, moved into a package).
-Acceptance: a recursive multi-directory project imports to one graph;
-nested `make -j` under delegation respects the budget. Also worth doing:
-`vpath` resolution and symbolic `glob` for `$(wildcard)`.
+- Importer readability: carry comments over; symbolic `glob` for
+  `$(wildcard)`, substitution references for `patsubst`, `if … end` for
+  conditionals on overridable variables (README §10.3 "later" rows); `vpath`.
+- Sub-makes are fully concrete; prefixed rmake variables would make
+  `-t import` output of recursive projects editable.
+- M9 (optional): tracing, CAS cache, `tool` attribute (README §14.1).
+- M8 (Windows) stays deferred unless the owner says otherwise.

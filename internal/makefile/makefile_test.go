@@ -68,7 +68,6 @@ func TestApproximations(t *testing.T) {
 		{"VPATH = src\nall:\n\ttrue\n", "VPATH is not supported"},
 		{"SHELL = /bin/bash\nall:\n\ttrue\n", "SHELL is set"},
 		{".ONESHELL:\nall:\n\ttrue\n", ".ONESHELL is not supported"},
-		{"all:\n\t$(MAKE) -C sub\n", "recursive make"},
 		{"app: gen\n\tcp x $@\n.PHONY: gen\ngen:\n\techo gen\n", "depends on the task gen, which has a recipe"},
 		{"all: a\nall: X = 1\na:\n\techo $(X) > $@\n", "target-specific variable X of all is inherited by a"},
 		{"all:\n\techo 'a \\\n\tb' > $@\n", "continues inside single quotes"},

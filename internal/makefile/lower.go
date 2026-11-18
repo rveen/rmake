@@ -43,6 +43,10 @@ type node struct {
 	depfile     string               // rules: depfile written with -MD/-MMD
 	usesTarget  bool                 // the recipe references $@
 	fromRule    *patternRule         // the implicit rule that makes it
+	lowered     bool                 // lowerRecipe ran
+	subNeeds    []string             // tasks: needs from recursive makes (emitted names)
+	subKeys     [][]string           // tasks: graph keys of each recursive make's goals
+	always      bool                 // rules: a delegated recursive make
 }
 
 // knownTasks are target names that are tasks even when not marked .PHONY.
@@ -66,6 +70,20 @@ type lowering struct {
 	notes    []Note
 	usesMD   bool
 	exported map[*patternRule]bool
+
+	// Sub-makes (recursive make, README §10.3): a lowering of a makefile
+	// in directory prefix (root-relative) whose rules run there ("dir"),
+	// whose tasks are named tprefix+name, and whose variables are all
+	// expanded (concrete).
+	prefix   string
+	tprefix  string
+	concrete bool
+	root     *lowering
+	// Root only.
+	subs    map[string]*lowering // by import key
+	subList []*lowering
+	busy    map[string]bool
+	pairs   []orderPair
 }
 
 type symInfo struct {
@@ -74,56 +92,41 @@ type symInfo struct {
 	refs  map[string]bool
 }
 
-func (m *Makefile) lower() *Result {
+func newLowering(m *Makefile, prefix string, root *lowering) *lowering {
 	m.searchCache = map[string]*match{}
-	l := &lowering{m: m, nodes: map[string]*node{}, symUsed: map[string]bool{}, symInfo: map[string]*symInfo{}, owner: map[string]string{}}
+	l := &lowering{m: m, nodes: map[string]*node{}, symUsed: map[string]bool{}, symInfo: map[string]*symInfo{},
+		owner: map[string]string{}, prefix: prefix, root: root}
+	if root == nil {
+		l.root = l
+		l.subs, l.busy = map[string]*lowering{}, map[string]bool{}
+	} else {
+		l.concrete = true
+		l.tprefix = taskPrefix(prefix)
+	}
+	return l
+}
 
-	// Roots: explicit targets in definition order, then goals.
-	var roots []*target
-	for _, t := range m.targets {
-		roots = append(roots, t)
-	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].order < roots[j].order })
-	for _, t := range roots {
-		if !specialTargets[t.name] {
-			l.visit(t.name)
-		}
-	}
-	goal := m.defaultGoal()
-	if goal != "" {
-		l.visit(goal)
-	}
-	for _, g := range m.opts.Goals {
-		l.visit(g)
-	}
-
-	// Recipes, in order.
-	for _, n := range l.list {
-		if n.alias == nil && (n.kind == kRule || n.kind == kTask) {
-			l.lowerRecipe(n)
-		}
-	}
-	l.taskHeuristic()
-	l.checkInheritance()
-	if m.depIncludes && !l.usesMD {
-		m.pos = syntax.Pos{File: m.opts.File, Line: 1, Col: 1}
-		m.note(false, "dependency files (.d) are included, but no recipe writes them with -MD or -MMD: header dependencies are lost")
-	}
-	if m.depIncludes {
-		m.pos = syntax.Pos{File: m.opts.File, Line: 1, Col: 1}
-		m.note(false, "included .d files dropped: rules compiled with -MD/-MMD use deps gcc instead")
-	}
+func (m *Makefile) lower() *Result {
+	l := newLowering(m, "", nil)
+	goal := l.analyze()
+	l.checkOrder()
 
 	var patterns string
 	if m.opts.Fragment {
 		patterns = l.exportPatterns()
 	}
 	body := patterns + l.emitNodes()
+	for _, sub := range l.subList {
+		body += sub.emitNodes()
+	}
 	vars := l.emitVars()
+	notes := append(append([]Note(nil), m.notes...), l.notes...)
+	for _, sub := range l.subList {
+		notes = append(append(notes, sub.m.notes...), sub.notes...)
+	}
 
 	var b strings.Builder
-	b.WriteString("# Imported from " + m.opts.File + " by rmake.\n")
-	notes := append(m.notes, l.notes...)
+	b.WriteString("# Imported from " + m.opts.Name + " by rmake.\n")
 	sort.SliceStable(notes, func(i, j int) bool {
 		a, c := notes[i].Pos, notes[j].Pos
 		if a.File != c.File {
@@ -150,10 +153,90 @@ func (m *Makefile) lower() *Result {
 	// up here rather than as a confusing error later.
 	f, err := syntax.Parse(m.opts.File, []byte(b.String()))
 	if err != nil {
-		m.pos = syntax.Pos{File: m.opts.File, Line: 1, Col: 1}
+		m.pos = syntax.Pos{File: m.opts.Name, Line: 1, Col: 1}
 		m.fail("internal error: the import is not a valid build file: %v\n%s", err, b.String())
 	}
 	return &Result{Source: syntax.Format(f), Notes: notes, Dropped: l.dropped}
+}
+
+// analyze visits the makefile's targets and goals and lowers their
+// recipes. It returns the default goal.
+func (l *lowering) analyze() string {
+	m := l.m
+	// Roots: explicit targets in definition order, then goals.
+	var roots []*target
+	for _, t := range m.targets {
+		roots = append(roots, t)
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].order < roots[j].order })
+	for _, t := range roots {
+		if !specialTargets[t.name] {
+			l.visit(t.name)
+		}
+	}
+	goal := m.defaultGoal()
+	if goal != "" {
+		l.visit(goal)
+	}
+	l.lowerPending()
+	// Command-line goals the makefiles do not make themselves (a file
+	// made by a built-in rule, say). Those a sub-make makes are left to it.
+	for _, g := range m.opts.Goals {
+		if _, ok := l.nodes[g]; !ok && !l.root.produces(path.Clean(g)) {
+			l.ensure(g)
+		}
+	}
+	l.taskHeuristic()
+	l.checkInheritance()
+	if m.depIncludes && !l.usesMD {
+		m.pos = syntax.Pos{File: m.opts.Name, Line: 1, Col: 1}
+		m.note(false, "dependency files (.d) are included, but no recipe writes them with -MD or -MMD: header dependencies are lost")
+	}
+	if m.depIncludes {
+		m.pos = syntax.Pos{File: m.opts.Name, Line: 1, Col: 1}
+		m.note(false, "included .d files dropped: rules compiled with -MD/-MMD use deps gcc instead")
+	}
+	return goal
+}
+
+// lowerPending lowers the recipes of visited nodes, in order.
+func (l *lowering) lowerPending() {
+	for i := 0; i < len(l.list); i++ {
+		n := l.list[i]
+		if n.alias == nil && !n.lowered && (n.kind == kRule || n.kind == kTask) {
+			n.lowered = true
+			l.lowerRecipe(n)
+		}
+	}
+}
+
+// ensure visits a target after the analysis (a goal of a later recursive
+// make) and lowers what it needs.
+func (l *lowering) ensure(name string) *node {
+	n := l.visit(name)
+	l.lowerPending()
+	return n
+}
+
+// produces reports whether a lowering of the import has a node for the
+// root-relative path p.
+func (root *lowering) produces(p string) bool {
+	for _, l := range append([]*lowering{root}, root.subList...) {
+		for _, n := range l.list {
+			if l.path(n.name) == p && n.kind != kMissing {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// path maps a path of this makefile to a root-relative path.
+func (l *lowering) path(p string) string {
+	if p == "" || path.IsAbs(p) {
+		return p
+	}
+	return path.Clean(path.Join(l.prefix, p))
 }
 
 func (m *Makefile) defaultGoal() string {
@@ -350,7 +433,7 @@ func (l *lowering) inputs(n *node) (kept, extra []string, always bool) {
 	seen := map[string]bool{}
 	var flatten func(p *node, depth int)
 	add := func(list *[]string, p string) {
-		c := clean(p)
+		c := l.path(p)
 		if !seen[c] {
 			seen[c] = true
 			*list = append(*list, c)
@@ -473,7 +556,7 @@ type ruleSym struct {
 }
 
 func (s *ruleSym) automatic(name string) (string, bool) {
-	if s.task {
+	if s.task || s.l.concrete {
 		return "", false
 	}
 	n := s.n
@@ -509,6 +592,9 @@ func (s *ruleSym) variable(name string, c *ctx) (string, bool) {
 // symbolic reports whether a reference to make variable name may stay
 // symbolic in context c, and returns its rmake name.
 func (l *lowering) symbolic(name string, c *ctx) (string, bool) {
+	if l.concrete {
+		return "", false
+	}
 	if _, ok := c.target[name]; ok {
 		return "", false
 	}
@@ -618,7 +704,7 @@ func (l *lowering) lowerRecipe(n *node) {
 		kept, _, _ := l.inputs(n)
 		if uses["^"] || uses["+"] || uses["?"] {
 			explicit = kept
-		} else if len(kept) > 0 && len(n.prereqs) > 0 && kept[0] == n.prereqs[0] {
+		} else if len(kept) > 0 && len(n.prereqs) > 0 && kept[0] == l.path(n.prereqs[0]) {
 			explicit = kept[:1]
 		}
 		if uses["?"] {
@@ -631,6 +717,9 @@ func (l *lowering) lowerRecipe(n *node) {
 	c := &ctx{auto: auto, target: n.vars}
 	for _, rl := range n.recipe.lines {
 		m.pos = rl.pos
+		if l.recursive(n, rl, c) {
+			continue
+		}
 		l.lowerLine(n, rl, c, sym)
 	}
 }
@@ -662,9 +751,6 @@ func (l *lowering) lowerLine(n *node, rl recipeLine, c *ctx, sym symbolicer) {
 	tc := *c
 	tc.taint = t
 	tm := m.template(rl.text, &tc, sym)
-	if t.refs["MAKE"] {
-		m.note(true, "recursive make in the recipe of %s is not supported by the importer yet", n.name)
-	}
 	conc := concrete(tm)
 	if strings.Contains(strings.ReplaceAll(conc, "\\\n", ""), "\n") {
 		// A multi-line value (define): each line is a command; no
@@ -817,7 +903,8 @@ func (l *lowering) taskHeuristic() {
 		}
 	}
 	for _, n := range l.list {
-		if n.kind != kRule || n.alias != nil || n.empty || needed[n.name] || l.m.exist(n.name) || n.usesTarget {
+		if n.kind != kRule || n.alias != nil || n.empty || needed[n.name] || l.m.exist(n.name) || n.usesTarget ||
+			n.always || !syntax.IsTaskName(l.tprefix+n.name) {
 			continue
 		}
 		mentions := false
@@ -968,14 +1055,14 @@ func (l *lowering) checkInheritance() {
 func (l *lowering) ref(n *node) (string, bool) {
 	switch l.kindOf(n) {
 	case kTask, kPseudo:
-		if syntax.IsTaskName(n.name) {
-			return n.name, true
+		if syntax.IsTaskName(l.tprefix + n.name) {
+			return l.tprefix + n.name, true
 		}
 		return "", false
 	case kDir:
 		return "", false
 	}
-	return quoteWord(clean(n.name)), true
+	return quoteWord(l.path(n.name)), true
 }
 
 // emitNodes renders rules and tasks in definition order.
@@ -1020,7 +1107,7 @@ func (l *lowering) emitNodes() string {
 			implicit = append(implicit, extra...)
 			b.WriteString("\nrule")
 			for _, o := range n.outs {
-				b.WriteString(" " + quoteWord(clean(o)))
+				b.WriteString(" " + quoteWord(l.path(o)))
 			}
 			b.WriteString(" from")
 			for _, p := range explicit {
@@ -1033,13 +1120,17 @@ func (l *lowering) emitNodes() string {
 				}
 			}
 			b.WriteString("\n")
-			if always {
+			if always || n.always {
 				b.WriteString("  always\n")
 			}
+			if l.prefix != "" {
+				b.WriteString("  dir " + quoteWord(l.prefix) + "\n")
+			}
 			if n.depfile != "" {
+				df := l.path(n.depfile)
 				b.WriteString("  deps gcc\n")
-				if n.depfile != clean(n.outs[0])+".d" {
-					b.WriteString("  depfile " + quoteWord(n.depfile) + "\n")
+				if df != l.path(n.outs[0])+".d" {
+					b.WriteString("  depfile " + quoteWord(df) + "\n")
 				}
 			}
 			l.writePass(&b)
@@ -1050,12 +1141,12 @@ func (l *lowering) emitNodes() string {
 			if l.kindOf(n) == kPseudo && len(n.prereqs)+len(n.orderOnly) == 0 && !wanted[n.name] {
 				continue // FORCE-like: folded into always where used
 			}
-			if !syntax.IsTaskName(n.name) {
+			if !syntax.IsTaskName(l.tprefix + n.name) {
 				m.pos = n.pos
 				m.note(true, "%s cannot be a task name; it is left out", n.name)
 				continue
 			}
-			b.WriteString("\ntask " + n.name)
+			b.WriteString("\ntask " + l.tprefix + n.name)
 			var needs []string
 			for _, p := range dedup(append(append([]string(nil), n.prereqs...), n.orderOnly...)) {
 				pn := l.nodes[p]
@@ -1066,11 +1157,15 @@ func (l *lowering) emitNodes() string {
 					needs = append(needs, r)
 				}
 			}
+			needs = append(needs, n.subNeeds...)
 			if len(needs) > 0 {
 				b.WriteString(" needs " + strings.Join(needs, " "))
 			}
 			b.WriteString("\n")
 			if len(n.cmds) > 0 {
+				if l.prefix != "" {
+					b.WriteString("  dir " + quoteWord(l.prefix) + "\n")
+				}
 				l.writePass(&b)
 			}
 			for _, c := range n.cmds {
@@ -1083,7 +1178,7 @@ func (l *lowering) emitNodes() string {
 
 // writePass writes a pass attribute for exported variables.
 func (l *lowering) writePass(b *strings.Builder) {
-	if len(l.m.exports) == 0 {
+	if len(l.m.exports) == 0 || l.concrete {
 		return
 	}
 	var names []string

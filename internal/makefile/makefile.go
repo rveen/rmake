@@ -29,6 +29,7 @@ type Options struct {
 	// (included makefiles, whose targets the importer does not know).
 	Fragment bool
 	Stderr   io.Writer // $(info), $(warning)
+	Name     string    // the makefile's name in positions (default File)
 }
 
 // Note is a remark about the import. An approximation (Approx) means the
@@ -161,11 +162,36 @@ func (m *Makefile) note(approx bool, format string, args ...any) {
 
 // Import evaluates the makefile and lowers it to rmake text.
 func Import(opts Options) (res *Result, err error) {
+	defer catch(&err)
+	m, err := load(opts)
+	if err != nil {
+		return nil, err
+	}
+	return m.lower(), nil
+}
+
+// catch turns a failure raised with m.fail into an error.
+func catch(err *error) {
+	if r := recover(); r != nil {
+		f, ok := r.(failure)
+		if !ok {
+			panic(r)
+		}
+		*err = f.err
+	}
+}
+
+// load reads and evaluates a makefile. Errors in the makefile panic with
+// failure (see catch).
+func load(opts Options) (*Makefile, error) {
 	if opts.Dir == "" {
 		opts.Dir = "."
 	}
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
+	}
+	if opts.Name == "" {
+		opts.Name = opts.File
 	}
 	abs, err := filepath.Abs(opts.Dir)
 	if err != nil {
@@ -178,22 +204,13 @@ func Import(opts Options) (res *Result, err error) {
 		phony: map[string]bool{}, mentioned: map[string]bool{}, exports: map[string]bool{},
 		prefix: '\t', exists: map[string]bool{},
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			f, ok := r.(failure)
-			if !ok {
-				panic(r)
-			}
-			res, err = nil, f.err
-		}
-	}()
 	m.init()
-	src, rerr := os.ReadFile(filepath.Join(opts.Dir, opts.File))
-	if rerr != nil {
-		return nil, rerr
+	src, err := os.ReadFile(filepath.Join(opts.Dir, opts.File))
+	if err != nil {
+		return nil, err
 	}
-	m.read(newSource(opts.File, string(src)))
-	return m.lower(), nil
+	m.read(newSource(opts.Name, string(src)))
+	return m, nil
 }
 
 // init defines the default, environment and command-line variables.

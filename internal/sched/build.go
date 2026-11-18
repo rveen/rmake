@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -38,10 +39,8 @@ type node struct {
 	failedDep  bool  // a dependency failed or was skipped
 
 	// Set when the step is decided to run.
-	d    decision          // rules
-	cmds []graph.Cmd       // tasks: expanded commands
-	env  map[string]string // tasks: pass'ed variables
-	desc string            // tasks: expanded desc
+	d   decision      // rules
+	run graph.TaskRun // tasks: the expanded task
 }
 
 // job is one step running in a worker.
@@ -53,6 +52,7 @@ type job struct {
 	rule *graph.Rule
 	cmds []graph.Cmd
 	env  []string
+	dir  string // root-relative working directory
 
 	// Results, written by the worker.
 	out    bytes.Buffer // captured output and failure messages
@@ -169,6 +169,27 @@ func (r *run) loop() error {
 	results := make(chan *job)
 	running := 0
 	done := r.ctx.Done()
+
+	// With a jobserver, rmake has one implicit job slot and one more per
+	// token it holds; tokens are acquired in the background and returned
+	// as soon as they are not needed, so that nested makes can use them.
+	type token struct {
+		b   byte
+		err error
+	}
+	var held []byte
+	tokens := make(chan token, 1)
+	acquiring := false
+	slots := func() int {
+		if b.Tokens == nil {
+			return jobs
+		}
+		return 1 + len(held)
+	}
+	release := func() {
+		b.Tokens.Release(held[len(held)-1])
+		held = held[:len(held)-1]
+	}
 	for {
 		if !r.stop && r.ctx.Err() != nil {
 			r.stop, r.interrupted, done = true, true, nil
@@ -176,12 +197,19 @@ func (r *run) loop() error {
 		for !r.stop && r.ready.Len() > 0 {
 			r.decide(heap.Pop(&r.ready).(int))
 		}
-		for !r.stop && running < jobs && r.runnable.Len() > 0 {
+		for !r.stop && running < slots() && r.runnable.Len() > 0 {
 			j := r.start(heap.Pop(&r.runnable).(int))
 			running++
 			go func() {
 				b.work(r.ctx, j)
 				results <- j
+			}()
+		}
+		if b.Tokens != nil && !r.stop && !acquiring && r.runnable.Len() > 0 && running < jobs {
+			acquiring = true
+			go func() {
+				t, err := b.Tokens.Acquire()
+				tokens <- token{t, err}
 			}()
 		}
 		if running == 0 {
@@ -191,9 +219,31 @@ func (r *run) loop() error {
 		case j := <-results:
 			running--
 			r.complete(j)
+			if b.Tokens != nil && len(held) > 0 && running < slots() {
+				release()
+			}
+		case t := <-tokens:
+			acquiring = false
+			if t.err != nil {
+				b.Tokens, held = nil, nil // the jobserver is gone: fall back to -j
+				break
+			}
+			held = append(held, t.b)
+			if r.stop || r.runnable.Len() == 0 {
+				release()
+			}
 		case <-done:
 			r.stop, r.interrupted, done = true, true, nil
 		}
+	}
+	if acquiring {
+		// Nothing runs any more, so the token comes back soon.
+		if t := <-tokens; t.err == nil {
+			held = append(held, t.b)
+		}
+	}
+	for len(held) > 0 {
+		release()
 	}
 	r.prog.end()
 	if r.worked {
@@ -242,7 +292,7 @@ func (r *run) decide(i int) {
 		return
 	}
 	if t := n.step.Task; t != nil {
-		cmds, env, desc, err := t.Expand(n.step.Args)
+		run, err := t.Expand(n.step.Args)
 		if err != nil {
 			r.prog.message(fmt.Sprintf("FAILED: task %s\nrmake: %s: %v\n", t.Name, t.Pos, err))
 			r.fail(i)
@@ -251,13 +301,13 @@ func (r *run) decide(i int) {
 		r.worked = true
 		if b.DryRun {
 			fmt.Fprintf(b.Out, "# task %s: tasks always run\n", taskName(n.step))
-			for _, c := range cmds {
+			for _, c := range run.Cmds {
 				fmt.Fprintln(b.Out, c.String())
 			}
 			r.finish(i, true)
 			return
 		}
-		n.cmds, n.env, n.desc = cmds, env, desc
+		n.run = run
 		heap.Push(&r.runnable, i)
 		return
 	}
@@ -301,9 +351,10 @@ func (r *run) start(i int) *job {
 	if t := n.step.Task; t != nil {
 		name := taskName(n.step)
 		j.what = "task " + name
-		j.cmds = n.cmds
-		j.env = execx.Env(b.BaseEnv, n.env)
-		j.desc = n.desc
+		j.cmds = n.run.Cmds
+		j.env = execx.Env(b.BaseEnv, n.run.Env)
+		j.desc = n.run.Desc
+		j.dir = n.run.Dir
 		if j.desc == "" {
 			j.desc = j.what
 		}
@@ -313,6 +364,7 @@ func (r *run) start(i int) *job {
 		j.what = strings.Join(rule.Outs, " ")
 		j.cmds = rule.Cmds
 		j.env = execx.Env(b.BaseEnv, rule.Env)
+		j.dir = rule.Dir
 		j.desc = rule.Desc
 		if j.desc == "" && len(rule.Cmds) > 0 {
 			j.desc = rule.Cmds[0].String()
@@ -379,7 +431,7 @@ func (b *Builder) runCmds(ctx context.Context, j *job) error {
 			fmt.Fprintln(&j.out, c.String())
 		}
 		j.ran++
-		res, err := execx.Run(ctx, b.Res, c, b.Root, j.env)
+		res, err := execx.Run(ctx, b.Res, c, b.abs(j.dir), j.env)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ErrInterrupted
@@ -501,6 +553,9 @@ func (b *Builder) discovered(r *graph.Rule, deps []string) map[string]string {
 	root := b.absRoot()
 	m := map[string]string{}
 	for _, p := range deps {
+		if r.Dir != "" && !path.IsAbs(p) {
+			p = path.Join(r.Dir, p) // the commands ran in r.Dir
+		}
 		p = depfile.Normalize(p, root)
 		if declared[p] {
 			continue

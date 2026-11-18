@@ -110,7 +110,8 @@ func TestExample(t *testing.T) {
 		t.Error("bin/server not always")
 	}
 	rel := g.Tasks["release"]
-	c, _, desc, err := rel.Expand([]string{"1.4.0"})
+	tr, err := rel.Expand([]string{"1.4.0"})
+	c, desc := tr.Cmds, tr.Desc
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +316,8 @@ task t
 var v = late
 `
 	g := load(t, map[string]string{"Rmakefile": src}, Options{})
-	c, _, _, err := g.Tasks["t"].Expand(nil)
+	tr, err := g.Tasks["t"].Expand(nil)
+	c := tr.Cmds
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -119,3 +119,42 @@ func TestIncludeMakefileFromRmakefile(t *testing.T) {
 		t.Error("wrong content")
 	}
 }
+
+func TestDirAttribute(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no cc")
+	}
+	// Commands run in dir; depfile paths written there are relative to it.
+	p := newProj(t, map[string]string{
+		"Rmakefile": `rule lib/x.o from lib/x.c
+  dir lib
+  deps gcc
+  depfile lib/x.d
+  sh "echo x.o >> ../ran.log; cc -MMD -Iinc -c x.c -o x.o"
+task show
+  dir lib
+  sh "pwd > ../pwd.txt"
+`,
+		"lib/x.c":     "#include \"x.h\"\nint x(void) { return X; }\n",
+		"lib/inc/x.h": "#define X 1\n",
+	})
+	p.expect("first", []string{"x.o"})
+	p.expect("no-op", nil)
+	_, out, _ := p.build("-t", "query", "lib/x.o")
+	if !strings.Contains(out, "runs in: lib") || !strings.Contains(out, "lib/inc/x.h") {
+		t.Errorf("query:\n%s", out)
+	}
+	p.write("lib/inc/x.h", "#define X 2\n")
+	p.expect("header", []string{"x.o"})
+	p.expect("task", nil, "show")
+	if !strings.HasSuffix(strings.TrimSpace(p.read("pwd.txt")), "/lib") {
+		t.Errorf("task dir: %q", p.read("pwd.txt"))
+	}
+	// dir in an included file is relative to that file's directory.
+	p.write("Rmakefile", "include lib/Rmakefile\n")
+	p.write("lib/Rmakefile", "task where\n  dir .\n  sh \"pwd > ../pwd2.txt\"\n")
+	p.expect("included", nil, "where")
+	if !strings.HasSuffix(strings.TrimSpace(p.read("pwd2.txt")), "/lib") {
+		t.Errorf("included dir: %q", p.read("pwd2.txt"))
+	}
+}

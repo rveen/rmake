@@ -93,6 +93,9 @@ func (b *Builder) Query(w io.Writer, target string) error {
 	if r.Deps != "" {
 		fmt.Fprintf(w, "  deps: %s (depfile %s)\n", r.Deps, r.Depfile)
 	}
+	if r.Dir != "" {
+		fmt.Fprintf(w, "  runs in: %s\n", r.Dir)
+	}
 	if len(r.Env) > 0 {
 		var env []string
 		for _, k := range sortedKeys(r.Env) {

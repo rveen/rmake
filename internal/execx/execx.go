@@ -85,22 +85,32 @@ func NewResolver(root string) *Resolver {
 	return &Resolver{root: root, cache: map[string]resolved{}}
 }
 
-// Resolve returns the absolute path of the program a command runs.
-func (r *Resolver) Resolve(c graph.Cmd) (string, error) {
+// Resolve returns the absolute path of the program a command run in the
+// root runs.
+func (r *Resolver) Resolve(c graph.Cmd) (string, error) { return r.ResolveIn(c, r.root) }
+
+// ResolveIn returns the absolute path of the program a command run in dir
+// runs (a relative argv[0] with a '/' is relative to dir).
+func (r *Resolver) ResolveIn(c graph.Cmd, dir string) (string, error) {
 	name := Shell
 	if !c.Shell {
 		name = c.Argv[0]
 	}
+	key := name
+	relative := strings.Contains(name, "/") && !filepath.IsAbs(name)
+	if relative {
+		key = dir + "\x00" + name
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if v, ok := r.cache[name]; ok {
+	if v, ok := r.cache[key]; ok {
 		return v.path, v.err
 	}
 	var v resolved
 	if strings.Contains(name, "/") {
 		p := name
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(r.root, p)
+		if relative {
+			p = filepath.Join(dir, p)
 		}
 		v.path, v.err = filepath.Abs(p)
 	} else {
@@ -112,7 +122,7 @@ func (r *Resolver) Resolve(c graph.Cmd) (string, error) {
 	if v.err != nil {
 		v.err = fmt.Errorf("%s: command not found", name)
 	}
-	r.cache[name] = v
+	r.cache[key] = v
 	return v.path, v.err
 }
 
@@ -144,7 +154,7 @@ var WaitDelay = 10 * time.Second
 // the current directory. When ctx is cancelled the process group receives
 // the signal of an Interrupt cause, else SIGKILL.
 func Run(ctx context.Context, r *Resolver, c graph.Cmd, dir string, env []string) (Result, error) {
-	prog, err := r.Resolve(c)
+	prog, err := r.ResolveIn(c, dir)
 	if err != nil {
 		return Result{ExitCode: -1}, err
 	}

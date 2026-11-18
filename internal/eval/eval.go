@@ -568,14 +568,14 @@ func (p *pass) instantiate(r *syntax.Rule, sc *scope, ctx *fileCtx, outs, ins, i
 		rs.vars["stem"] = []string{*stem}
 		gr.Stem = *stem
 	}
-	cmds, env, err := p.attrs(r.Attrs, rs, ctx, gr)
+	run, err := p.attrs(r.Attrs, rs, ctx, gr)
 	if err != nil {
 		return err
 	}
-	if len(cmds) == 0 {
+	if len(run.Cmds) == 0 {
 		return syntax.Errorf(r.Pos, "rule has no run or sh command")
 	}
-	gr.Cmds, gr.Env = cmds, env
+	gr.Cmds, gr.Env = run.Cmds, run.Env
 	if gr.Depfile != "" && gr.Deps == "" {
 		return syntax.Errorf(r.Pos, "depfile requires deps")
 	}
@@ -594,22 +594,22 @@ func (p *pass) instantiate(r *syntax.Rule, sc *scope, ctx *fileCtx, outs, ins, i
 // attrs evaluates rule or task attributes in scope rs. Local variables are
 // evaluated first, in order, then the remaining attributes. gr is nil for
 // tasks; rule-only attributes are stored in it.
-func (p *pass) attrs(as []*syntax.Attr, rs *scope, ctx *fileCtx, gr *graph.Rule) ([]graph.Cmd, map[string]string, error) {
+// attrs evaluates the attributes of a rule (gr) or task (gr == nil).
+func (p *pass) attrs(as []*syntax.Attr, rs *scope, ctx *fileCtx, gr *graph.Rule) (graph.TaskRun, error) {
+	var run graph.TaskRun
 	for _, a := range as {
 		if a.Kind == "var" {
 			if err := p.assign(a.Var, rs, ctx, true); err != nil {
-				return nil, nil, err
+				return run, err
 			}
 		}
 	}
-	var cmds []graph.Cmd
-	var env map[string]string
 	seen := map[string]bool{}
 	for _, a := range as {
 		switch a.Kind {
-		case "desc", "deps", "depfile", "always":
+		case "desc", "deps", "depfile", "always", "dir":
 			if seen[a.Kind] {
-				return nil, nil, syntax.Errorf(a.Pos, "duplicate %s", a.Kind)
+				return run, syntax.Errorf(a.Pos, "duplicate %s", a.Kind)
 			}
 			seen[a.Kind] = true
 		}
@@ -617,41 +617,48 @@ func (p *pass) attrs(as []*syntax.Attr, rs *scope, ctx *fileCtx, gr *graph.Rule)
 		case "run":
 			argv, err := expandWords(a.Args, rs)
 			if err != nil {
-				return nil, nil, err
+				return run, err
 			}
 			if len(argv) == 0 || argv[0] == "" {
-				return nil, nil, syntax.Errorf(a.Pos, "command expands to nothing")
+				return run, syntax.Errorf(a.Pos, "command expands to nothing")
 			}
-			cmds = append(cmds, graph.Cmd{Pos: a.Pos, Argv: argv})
+			run.Cmds = append(run.Cmds, graph.Cmd{Pos: a.Pos, Argv: argv})
 		case "sh":
 			s, err := expandJoined(a.Args, rs)
 			if err != nil {
-				return nil, nil, err
+				return run, err
 			}
-			cmds = append(cmds, graph.Cmd{Pos: a.Pos, Shell: true, Script: s})
+			run.Cmds = append(run.Cmds, graph.Cmd{Pos: a.Pos, Shell: true, Script: s})
 		case "pass":
 			for _, w := range a.Args {
 				v, ok := rs.lookup(w.Raw)
 				if !ok {
-					return nil, nil, syntax.Errorf(w.Pos, "pass: undefined variable %s", w.Raw)
+					return run, syntax.Errorf(w.Pos, "pass: undefined variable %s", w.Raw)
 				}
-				if env == nil {
-					env = map[string]string{}
+				if run.Env == nil {
+					run.Env = map[string]string{}
 				}
-				env[w.Raw] = strings.Join(v, " ")
+				run.Env[w.Raw] = strings.Join(v, " ")
 			}
-		case "desc", "depfile":
+		case "desc", "depfile", "dir":
 			s, err := expandJoined(a.Args, rs)
 			if err != nil {
-				return nil, nil, err
+				return run, err
 			}
-			if gr == nil {
-				continue // task desc is handled by the caller
-			}
-			if a.Kind == "desc" {
-				gr.Desc = s
-			} else {
-				gr.Depfile = path.Clean(s)
+			switch a.Kind {
+			case "desc":
+				run.Desc = s
+			case "depfile":
+				if gr != nil {
+					gr.Depfile = path.Clean(s)
+				}
+			case "dir":
+				// Like inputs: relative to the build file's directory.
+				d := p.rel(ctx.dir, s)
+				if d == "." {
+					d = ""
+				}
+				run.Dir = d
 			}
 		case "deps":
 			gr.Deps = a.Args[0].Raw
@@ -659,7 +666,10 @@ func (p *pass) attrs(as []*syntax.Attr, rs *scope, ctx *fileCtx, gr *graph.Rule)
 			gr.Always = true
 		}
 	}
-	return cmds, env, nil
+	if gr != nil {
+		gr.Desc, gr.Dir = run.Desc, run.Dir
+	}
+	return run, nil
 }
 
 func (p *pass) task(t *syntax.Task, sc *scope, ctx *fileCtx) error {
@@ -680,38 +690,26 @@ func (p *pass) task(t *syntax.Task, sc *scope, ctx *fileCtx) error {
 		}
 		seen[name] = true
 	}
-	expand := func(args []string) ([]graph.Cmd, map[string]string, string, error) {
+	expand := func(args []string) (graph.TaskRun, error) {
 		ts := newScope(snap)
 		for i, name := range params {
 			ts.vars[name] = []string{args[i]}
 		}
-		cmds, env, err := p.attrs(t.Attrs, ts, ctx, nil)
-		if err != nil {
-			return nil, nil, "", err
-		}
-		desc := ""
-		for _, a := range t.Attrs {
-			if a.Kind == "desc" {
-				if desc, err = expandJoined(a.Args, ts); err != nil {
-					return nil, nil, "", err
-				}
-			}
-		}
-		return cmds, env, desc, nil
+		return p.attrs(t.Attrs, ts, ctx, nil)
 	}
 	// Check the task now, with placeholder arguments.
 	ph := make([]string, len(params))
 	for i, name := range params {
 		ph[i] = "<" + name + ">"
 	}
-	_, _, desc, err := expand(ph)
+	checked, err := expand(ph)
 	if err != nil {
 		return err
 	}
-	gt := &graph.Task{Pos: t.Pos, Name: t.Name, Params: params, Desc: desc}
-	gt.Expand = func(args []string) ([]graph.Cmd, map[string]string, string, error) {
+	gt := &graph.Task{Pos: t.Pos, Name: t.Name, Params: params, Desc: checked.Desc}
+	gt.Expand = func(args []string) (graph.TaskRun, error) {
 		if len(args) != len(params) {
-			return nil, nil, "", fmt.Errorf("task %s takes %d argument(s), got %d", t.Name, len(params), len(args))
+			return graph.TaskRun{}, fmt.Errorf("task %s takes %d argument(s), got %d", t.Name, len(params), len(args))
 		}
 		return expand(args)
 	}
