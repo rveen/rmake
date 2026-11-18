@@ -128,6 +128,34 @@ func (g *Graph) Targets() []string {
 	return out
 }
 
+// Files returns every file the graph mentions: inputs and outputs of rules
+// and file dependencies of tasks, without duplicates.
+func (g *Graph) Files() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(ps []string) {
+		for _, p := range ps {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	for _, r := range g.Rules {
+		add(r.Outs)
+		add(r.Ins)
+		add(r.Implicit)
+	}
+	for _, t := range g.TaskList {
+		for _, n := range t.Needs {
+			if g.Tasks[n] == nil {
+				add([]string{n})
+			}
+		}
+	}
+	return out
+}
+
 // node is a rule or a task in graph traversals.
 type node struct {
 	rule *Rule

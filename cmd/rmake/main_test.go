@@ -56,10 +56,6 @@ task release(version) needs build/app
 	if code != 0 || out != "build/a.o\nbuild/app\n" {
 		t.Errorf("targets: %q", out)
 	}
-	code, _, _ = runIn(t, dir)
-	if code != 1 {
-		t.Errorf("build without -n should fail until M2, got %d", code)
-	}
 
 	write("bad/Rmakefile", "rule a from b\n  rn x\n")
 	code, _, errs = runIn(t, filepath.Join(dir, "bad"), "-n")

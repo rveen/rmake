@@ -55,7 +55,7 @@ func Load(opts Options) (*graph.Graph, error) {
 		if err := p.run(); err != nil {
 			return nil, err
 		}
-		if !p.builddirGlobs || sameKeys(p.g.Producer, known) {
+		if p.stable() || sameKeys(p.g.Producer, known) {
 			if err := p.finish(); err != nil {
 				return nil, err
 			}
@@ -67,6 +67,38 @@ func Load(opts Options) (*graph.Graph, error) {
 		}
 	}
 	return nil, fmt.Errorf("%s: globs over $builddir do not reach a fixed point after %d passes", opts.File, maxPasses)
+}
+
+type globResult struct {
+	pat     string
+	matches []string
+}
+
+// stable reports whether this pass is a fixed point: every glob under
+// $builddir matches the same outputs against the final set of declared
+// outputs as it did during the pass. Evaluation is deterministic given the
+// glob results, so another pass would produce the same graph.
+func (p *pass) stable() bool {
+	for _, gr := range p.builddirGlobs {
+		n := 0
+		for o := range p.g.Producer {
+			if glob.Match(gr.pat, o) {
+				n++
+			}
+		}
+		// Matches during the pass were a subset of known ∪ declared; with
+		// the same count against the final outputs they are the same set,
+		// provided none came only from known.
+		if n != len(gr.matches) {
+			return false
+		}
+		for _, m := range gr.matches {
+			if p.g.Producer[m] == nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func sameKeys(m map[string]*graph.Rule, set map[string]bool) bool {
@@ -94,8 +126,8 @@ type pass struct {
 	known         map[string]bool // outputs declared in the previous pass
 	g             *graph.Graph
 	builddir      string
-	locked        bool // builddir may no longer change
-	builddirGlobs bool // a glob under builddir was evaluated
+	locked        bool         // builddir may no longer change
+	builddirGlobs []globResult // globs under builddir evaluated in this pass
 	stack         []string
 	first         string // first non-pattern rule output or task in the root file
 	defaults      []pending
@@ -326,7 +358,6 @@ func (p *pass) glob(pat string, pos syntax.Pos) ([]string, error) {
 		return nil, syntax.Errorf(pos, "invalid glob pattern %q", pat)
 	}
 	if p.inBuilddir(pat) {
-		p.builddirGlobs = true
 		set := map[string]bool{}
 		for o := range p.known {
 			if glob.Match(pat, o) {
@@ -343,6 +374,7 @@ func (p *pass) glob(pat string, pos syntax.Pos) ([]string, error) {
 			out = append(out, o)
 		}
 		sort.Strings(out)
+		p.builddirGlobs = append(p.builddirGlobs, globResult{pat, out})
 		return out, nil
 	}
 	key := p.builddir + "\x00" + pat

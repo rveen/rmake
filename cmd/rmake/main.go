@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,11 +11,17 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/rveen/rmake/internal/eval"
+	"github.com/rveen/rmake/internal/execx"
 	"github.com/rveen/rmake/internal/graph"
+	"github.com/rveen/rmake/internal/hash"
+	"github.com/rveen/rmake/internal/sched"
+	"github.com/rveen/rmake/internal/state"
 	"github.com/rveen/rmake/internal/syntax"
 )
 
@@ -26,6 +33,16 @@ const (
 )
 
 func main() {
+	// RMAKE_CPUPROFILE=file writes a CPU profile, for performance work.
+	if f := os.Getenv("RMAKE_CPUPROFILE"); f != "" {
+		if w, err := os.Create(f); err == nil {
+			pprof.StartCPUProfile(w)
+			code := run(os.Args[1:], os.Stdout, os.Stderr)
+			pprof.StopCPUProfile()
+			w.Close()
+			os.Exit(code)
+		}
+	}
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
@@ -59,7 +76,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// Flags and name=value overrides may be interleaved up to the first
 	// target or task.
 	overrides := map[string][]string{}
-	rest := args
+	rest := makeStyleFlags(args)
 	for {
 		if err := fs.Parse(rest); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
@@ -100,14 +117,40 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "rmake:", err)
 		return exitUsage
 	}
+	timing := newTimer(stderr)
+	defer timing.done()
+
+	// Open the state store while the build file is evaluated.
+	type opened struct {
+		st  state.Store
+		err error
+	}
+	var stateCh chan opened
+	switch o.tool {
+	case "", "why", "query", "clean":
+		stateCh = make(chan opened, 1)
+		go func() {
+			st, err := state.Open(".rmake")
+			stateCh <- opened{st, err}
+		}()
+	}
+	defer func() {
+		if stateCh != nil { // never received: release the store
+			if r := <-stateCh; r.st != nil {
+				r.st.Close()
+			}
+		}
+	}()
+
 	g, err := eval.Load(eval.Options{File: file, Overrides: overrides, LookupEnv: os.LookupEnv})
+	timing.mark("load build file")
 	if err != nil {
 		fmt.Fprintln(stderr, "rmake:", err)
 		return exitUsage
 	}
 
 	switch o.tool {
-	case "":
+	case "", "why", "query", "clean":
 	case "targets":
 		for _, t := range g.Targets() {
 			fmt.Fprintln(stdout, t)
@@ -121,12 +164,68 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return exitUsage
 		}
 		return exitOK
-	case "why", "query", "clean":
-		fmt.Fprintf(stderr, "rmake: -t %s is not implemented yet (milestone M2)\n", o.tool)
-		return exitUsage
 	default:
 		fmt.Fprintf(stderr, "rmake: unknown tool %q\n", o.tool)
 		return exitUsage
+	}
+
+	so := <-stateCh
+	stateCh = nil
+	st := so.st
+	timing.mark("open state")
+	if so.err != nil {
+		fmt.Fprintln(stderr, "rmake:", so.err)
+		return exitFailure
+	}
+	defer st.Close()
+	b := &sched.Builder{
+		G:       g,
+		Store:   st,
+		Hash:    hash.New(".", st),
+		Res:     execx.NewResolver("."),
+		Root:    ".",
+		BaseEnv: execx.BaseEnv(os.Environ()),
+		Out:     stdout,
+		Verbose: o.verbose,
+		Force:   o.always,
+		Keep:    o.keep,
+		DryRun:  o.dry,
+	}
+	// Stat every file of the graph concurrently; planning and the rebuild
+	// decisions then use the results.
+	b.Hash.Prestat(g.Files())
+	exists := b.Hash.Exists
+	timing.mark("stat files")
+
+	switch o.tool {
+	case "why", "query":
+		if len(rest) != 1 {
+			fmt.Fprintf(stderr, "rmake: -t %s takes one target\n", o.tool)
+			return exitUsage
+		}
+		t := path.Clean(rest[0])
+		if o.tool == "why" {
+			err = b.Why(stdout, t, exists)
+		} else {
+			err = b.Query(stdout, t)
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "rmake:", err)
+			return exitUsage
+		}
+		return exitOK
+	case "clean":
+		n, err := b.Clean(stdout)
+		if err != nil {
+			fmt.Fprintln(stderr, "rmake:", err)
+			return exitFailure
+		}
+		fmt.Fprintf(stdout, "rmake: removed %d file(s)\n", n)
+		if err := st.Flush(); err != nil {
+			fmt.Fprintln(stderr, "rmake:", err)
+			return exitFailure
+		}
+		return exitOK
 	}
 
 	reqs, err := requests(g, rest)
@@ -135,15 +234,68 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	steps, err := g.Plan(reqs, exists)
+	timing.mark("plan")
 	if err != nil {
 		fmt.Fprintln(stderr, "rmake:", err)
 		return exitUsage
 	}
-	if !o.dry {
-		fmt.Fprintln(stderr, "rmake: building is not implemented yet (milestone M2); use -n")
+	err = b.Build(context.Background(), steps)
+	timing.mark("build")
+	if ferr := st.Flush(); ferr != nil && err == nil {
+		err = ferr
+	}
+	timing.mark("flush state")
+	switch {
+	case err == nil:
+		return exitOK
+	case errors.Is(err, sched.ErrFailed):
+		return exitFailure
+	default:
+		fmt.Fprintln(stderr, "rmake:", err)
 		return exitFailure
 	}
-	return dryRun(steps, stdout, stderr)
+}
+
+// timer prints phase durations to stderr when RMAKE_TIMING is set.
+type timer struct {
+	w           io.Writer
+	start, last time.Time
+}
+
+func newTimer(w io.Writer) *timer {
+	if os.Getenv("RMAKE_TIMING") == "" {
+		return nil
+	}
+	now := time.Now()
+	return &timer{w: w, start: now, last: now}
+}
+
+func (t *timer) mark(phase string) {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+	fmt.Fprintf(t.w, "rmake: %-16s %6.1f ms\n", phase, float64(now.Sub(t.last).Microseconds())/1000)
+	t.last = now
+}
+
+func (t *timer) done() {
+	if t != nil {
+		fmt.Fprintf(t.w, "rmake: %-16s %6.1f ms\n", "total", float64(time.Since(t.start).Microseconds())/1000)
+	}
+}
+
+// makeStyleFlags rewrites make-style -jN into -j=N, which the flag package
+// understands.
+func makeStyleFlags(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		if len(a) > 2 && strings.HasPrefix(a, "-j") && a[2] >= '0' && a[2] <= '9' {
+			a = "-j=" + a[2:]
+		}
+		out[i] = a
+	}
+	return out
 }
 
 // buildFile picks the build file: -f, else Rmakefile, else (later) an
@@ -161,11 +313,6 @@ func buildFile(f string) (string, error) {
 		}
 	}
 	return "", errors.New("no Rmakefile found")
-}
-
-func exists(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && !fi.IsDir()
 }
 
 func cleanAll(ss []string) []string {
@@ -206,30 +353,6 @@ func requests(g *graph.Graph, args []string) ([]graph.Request, error) {
 		reqs = append(reqs, graph.Request{Name: path.Clean(name)})
 	}
 	return reqs, nil
-}
-
-// dryRun prints what would run, and why. Without a state store (M2) every
-// rule would run because it has no build record.
-func dryRun(steps []graph.Step, stdout, stderr io.Writer) int {
-	for _, s := range steps {
-		var cmds []graph.Cmd
-		if s.Task != nil {
-			c, _, err := s.Task.Expand(s.Args)
-			if err != nil {
-				fmt.Fprintln(stderr, "rmake:", err)
-				return exitUsage
-			}
-			cmds = c
-			fmt.Fprintf(stdout, "# task %s: tasks always run\n", strings.Join(append([]string{s.Task.Name}, s.Args...), " "))
-		} else {
-			cmds = s.Rule.Cmds
-			fmt.Fprintf(stdout, "# %s: no build record\n", strings.Join(s.Rule.Outs, " "))
-		}
-		for _, c := range cmds {
-			fmt.Fprintln(stdout, c.String())
-		}
-	}
-	return exitOK
 }
 
 func toolTasks(g *graph.Graph, w io.Writer) int {

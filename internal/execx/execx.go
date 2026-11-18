@@ -1,0 +1,163 @@
+// Package execx runs rule and task commands (README §5.6): argv commands
+// without a shell, sh commands via /bin/sh -c, a filtered environment, and
+// combined output capture.
+package execx
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/rveen/rmake/internal/graph"
+)
+
+// Shell is the shell used for sh commands.
+const Shell = "/bin/sh"
+
+// maxArg is the longest sh script passed with -c; longer ones go to stdin.
+const maxArg = 64 << 10
+
+// keep lists the environment variables passed to every command.
+var keep = map[string]bool{
+	"PATH": true, "HOME": true, "TMPDIR": true, "TEMP": true, "TMP": true,
+	"LANG": true, "TERM": true, "SYSTEMROOT": true,
+}
+
+// BaseEnv filters environ (KEY=VALUE pairs) down to the variables every
+// command sees.
+func BaseEnv(environ []string) []string {
+	var out []string
+	for _, kv := range environ {
+		k, _, _ := strings.Cut(kv, "=")
+		if keep[k] || strings.HasPrefix(k, "LC_") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// Env returns base plus the pass'ed variables (which take precedence).
+func Env(base []string, pass map[string]string) []string {
+	if len(pass) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(pass))
+	for _, kv := range base {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, ok := pass[k]; !ok {
+			out = append(out, kv)
+		}
+	}
+	keys := make([]string, 0, len(pass))
+	for k := range pass {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+pass[k])
+	}
+	return out
+}
+
+// Resolver resolves argv[0] to an absolute path, caching PATH lookups for the
+// duration of a run.
+type Resolver struct {
+	root  string
+	cache map[string]resolved
+}
+
+type resolved struct {
+	path string
+	err  error
+}
+
+// NewResolver returns a resolver for commands run in root.
+func NewResolver(root string) *Resolver {
+	return &Resolver{root: root, cache: map[string]resolved{}}
+}
+
+// Resolve returns the absolute path of the program a command runs.
+func (r *Resolver) Resolve(c graph.Cmd) (string, error) {
+	name := Shell
+	if !c.Shell {
+		name = c.Argv[0]
+	}
+	if v, ok := r.cache[name]; ok {
+		return v.path, v.err
+	}
+	var v resolved
+	if strings.Contains(name, "/") {
+		p := name
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(r.root, p)
+		}
+		v.path, v.err = filepath.Abs(p)
+	} else {
+		v.path, v.err = exec.LookPath(name)
+		if v.err == nil {
+			v.path, v.err = filepath.Abs(v.path)
+		}
+	}
+	if v.err != nil {
+		v.err = fmt.Errorf("%s: command not found", name)
+	}
+	r.cache[name] = v
+	return v.path, v.err
+}
+
+// Result is the outcome of running a command.
+type Result struct {
+	Output   []byte // combined stdout and stderr
+	ExitCode int    // -1 if the command could not be started or was killed
+}
+
+// Run runs c in dir with env. A command that a relative argv[0] names (like
+// ./build/app) is resolved against dir, not the current directory.
+func Run(ctx context.Context, r *Resolver, c graph.Cmd, dir string, env []string) (Result, error) {
+	prog, err := r.Resolve(c)
+	if err != nil {
+		return Result{ExitCode: -1}, err
+	}
+	var cmd *exec.Cmd
+	switch {
+	case c.Shell && len(c.Script) > maxArg:
+		// Too long for one argument (Linux limits each to 128 KB): feed
+		// the script on stdin instead.
+		cmd = exec.CommandContext(ctx, prog, "-s")
+		cmd.Stdin = strings.NewReader(c.Script)
+	case c.Shell:
+		cmd = exec.CommandContext(ctx, prog, "-c", c.Script)
+	default:
+		cmd = exec.CommandContext(ctx, prog, c.Argv[1:]...)
+		cmd.Args[0] = c.Argv[0]
+	}
+	cmd.Dir = dir
+	cmd.Env = env
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err = cmd.Run()
+	res := Result{Output: out.Bytes()}
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+	case errors.As(err, &ee):
+		res.ExitCode = ee.ExitCode()
+		err = fmt.Errorf("exit status %d", res.ExitCode)
+		if res.ExitCode < 0 {
+			err = fmt.Errorf("%s", ee.ProcessState.String())
+		}
+	default:
+		res.ExitCode = -1
+	}
+	return res, err
+}
+
+// Environ is os.Environ, replaceable in tests.
+var Environ = os.Environ

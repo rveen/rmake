@@ -318,7 +318,9 @@ first rule or include).
 
 - `run` lines are argv lists executed directly (no shell). `argv[0]` is
   resolved through `PATH`.
-- `sh "..."` runs `/bin/sh -c`. *(deferred)* On Windows, `sh` must be found
+- `sh "..."` runs `/bin/sh -c`; a script longer than 64 KB is fed to
+  `/bin/sh -s` on stdin instead (Linux limits a single argument to 128 KB).
+  Otherwise commands get no stdin. *(deferred)* On Windows, `sh` must be found
   in `PATH` (Git for Windows, busybox); otherwise using `sh` is an error.
 - Several `run`/`sh` lines run in sequence; the first failure stops the rule.
 - Child environment is filtered: `PATH`, `HOME`, `TMPDIR`, `TEMP`, `TMP`,
@@ -431,14 +433,23 @@ between blocks, comments preserved). The same printer produces the output of
 
 ## 8. State store
 
-- Directory `.rmake/` at project root (add to `.gitignore`).
-- `.rmake/log`: append-only, JSON Lines, first line a header `{"rmake_state":1}`.
-  Record types: `file` (hash cache entry), `rule` (rule record).
-- Load: read all lines; last record per key wins; ignore a truncated final line.
+- Directory `.rmake/` at project root (add to `.gitignore`). `.rmake/lock` is
+  held (`flock`) while rmake runs, so concurrent runs in one project wait for
+  each other.
+- `.rmake/log`: append-only binary log behind the `state.Store` interface.
+  (A JSON Lines log was measured first: decoding 40k records took 170 ms of a
+  410 ms no-op build, so the format switched to binary as anticipated.)
+  - A magic header, then records framed as `uvarint(len) payload crc32c`.
+  - Record types: `file` (hash cache entry), `rule` (rule record, including
+    the key's components so `-t why` can explain changes), `delrule`.
+  - Strings are length-prefixed, maps are written with sorted keys.
+- Load: read all records; last record per key wins. The log is valid up to
+  the first incomplete or damaged record (torn write, bad checksum); the rest
+  is discarded and cut off before the next append. Losing state is always
+  safe: it only causes rebuilds.
 - Write: buffer during the build, append and `fsync` at the end and on interrupt.
-- Compact (rewrite to temp file, rename) when the file is > 2× the size of live records.
-- Format may switch to binary if profiling demands it; keep it behind an
-  interface in `internal/state`.
+- Compact (rewrite to a temp file, `fsync`, rename) when the log holds more
+  than twice as many records as are live (and more than 1000).
 
 ## 9. CLI
 
@@ -448,7 +459,7 @@ rmake [flags] [name=value ...] [target|task [args...] ...]
 flags:
   -C dir        change to dir first
   -f file       build file (default: Rmakefile, else Makefile via import)
-  -j N          parallel jobs
+  -j N          parallel jobs (make-style -jN also accepted)
   -k            keep going
   -n            dry run: list what would run, and why
   -B            treat every rule as out of date (with -n: list all commands)
@@ -474,6 +485,15 @@ consume exactly that many following arguments.
 Tools use `-t` (as in Ninja) so tool names never collide with target or task names.
 
 Exit codes: 0 ok, 1 build failure, 2 usage or build-file error, 130 interrupted.
+
+Output: one `[n/N] desc` line per rule that runs (`desc`, else the first
+command, shortened to 200 characters), followed by the command's captured
+output. A failure prints `FAILED: outputs`, the command, its output and the
+exit status. `-n` prints `# outputs: reasons` and the commands of every rule
+that would run. When nothing runs: `rmake: no work to do`.
+
+Diagnostics (environment variables): `RMAKE_TIMING=1` prints the duration of
+each phase to stderr; `RMAKE_CPUPROFILE=file` writes a Go CPU profile.
 
 ## 10. Makefile import
 
