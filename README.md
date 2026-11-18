@@ -147,14 +147,17 @@ the last command.
 
 ### 5.1 Lexical
 
-- UTF-8. Comments start with `#` to end of line.
-- Lines are **headers** or **attributes**. A line directly following a `rule`
-  or `task` header (or another attribute of it) that starts with whitespace
-  (spaces or tabs, any amount) is an attribute of that rule or task. The first
-  line that is not indented, or that does not follow a rule/task, ends the
+- UTF-8. A `#` at the start of a word (outside quotes) starts a comment that
+  runs to the end of the line; inside a word (`a#b`) it is literal.
+- Lines are **headers** or **attributes**. The lines following a `rule` or
+  `task` header that are indented **deeper than the header** (spaces or tabs,
+  any amount; blank and comment lines in between are allowed) are its
+  attributes. The first line indented no deeper than the header ends the
   block.
 - Everywhere else, indentation is insignificant: statements inside
-  `if … end` may be indented for readability.
+  `if … end` may be indented for readability (a rule inside an indented `if`
+  indents its attributes one level further).
+- Whitespace is space, tab, CR, VT and FF; CRLF line endings are accepted.
 - Words are separated by whitespace. `"..."` makes one word containing spaces;
   `\"` and `\\` are escapes inside quotes. `""` is one empty word.
 - `|` as a separate word in a `from` list separates explicit from implicit
@@ -203,8 +206,8 @@ concatenation).
 
 **Definitions.**
 
-- `var x = …` sets `x`. `var x += …` appends. Top-level definitions are
-  evaluated eagerly, top to bottom.
+- `var x = …` sets `x`. `var x += …` appends (to the empty list if `x` is
+  undefined). Top-level definitions are evaluated eagerly, top to bottom.
 - `var x ?= …` sets `x` only if it does not already have a value from the
   command line, the environment, or an earlier definition.
 - Precedence: **command line** (`rmake x=v`) > **environment** (only for
@@ -213,15 +216,18 @@ concatenation).
 - The environment is never read implicitly for `=`/`+=` variables.
 
 **Globs.** Words in a `var` are never globbed. `var srcs = glob src/**/*.c`
-expands the patterns (§5.4) into a sorted list. Glob resolution happens after
-all statements are evaluated (so it can see every declared output); a variable
-whose value depends on a glob is therefore resolved in that second phase.
+expands the patterns (§5.4) into a sorted list. Globs under `$builddir` see
+every declared output, including outputs declared further down (see
+§5.4, *Evaluation to a fixed point*).
 
 **Expansion.**
 
 - `$name` or `${name}` expands a variable. `$$` is a literal `$`.
 - A standalone `$x` expands to all its elements as separate words (separate
   argv entries).
+- **Inside quotes** a reference expands to its elements joined by single
+  spaces, so `sh "cc $cflags -c $in"` and `desc "link $in"` work as expected;
+  `"$empty"` is one empty word.
 - **Concatenation distributes** (rc semantics): if `x = a b`, then `-I$x` →
   `-Ia -Ib`. Concatenation with the empty list yields the empty list, so
   `-I$incs` with empty `incs` disappears. Concatenation with `""` yields the
@@ -235,6 +241,9 @@ whose value depends on a glob is therefore resolved in that second phase.
   - `${srcs:.c=.o}` → `src/a.o src/b.o`
   - `${srcs:%=-I%}` → `-Isrc/a.c -Isrc/b.c`
 - Undefined variable: error, with file:line:col. Use `?=` or `if defined`.
+- `if a == b` compares both sides after expansion, each joined with spaces.
+  `if defined x` is true if `x` has a value in scope or on the command line
+  (the environment is not consulted).
 
 **Built-ins.** `$os` (`linux`, `darwin`, `windows`, …), `$arch` (`amd64`,
 `arm64`, …), `$builddir` (default `build`; may be reassigned only before the
@@ -246,10 +255,16 @@ first rule or include).
   sorted), `$out` (all outputs), `$stem` (the `%` match in pattern rules).
 - Inside tasks: parameters are variables (`$version`).
 - Rule- and task-local `var` lines see top-level variables and `$in`, `$out`,
-  `$stem`, and shadow top-level variables for that rule only.
+  `$stem`, and shadow top-level variables for that rule only. They are
+  evaluated in order **before** the rule's other attributes, wherever they
+  appear in the block.
 - `run`/`sh` lines and rule-local vars are templates expanded when the rule is
-  instantiated. Using `$in`, `$out` or `$stem` in a top-level `var` is an
-  error.
+  instantiated. Using `$in` or `$out` in a top-level `var`, or `$stem` outside
+  a pattern rule, is an error.
+- A task sees the variables as they were at the point of its definition
+  (later redefinitions do not affect it); its commands are expanded when it is
+  invoked with its arguments, and checked at load time with placeholder
+  arguments.
 
 ### 5.4 Patterns and globs
 
@@ -261,24 +276,31 @@ first rule or include).
   - Other paths: match files on disk. Hidden directories (`.git`, `.rmake`) are skipped.
   - Results are sorted.
 - **Pattern rules**: an output containing one `%` makes the rule a pattern
-  rule. All outputs and inputs use the same `%`. Instantiation: replace `%`
-  with `*` in the first explicit input pattern, glob it, and create one
-  concrete rule per match with that stem.
-- **Chains** (`%.c from %.y`, then `%.o from %.c`): pattern rules are
-  instantiated repeatedly until no new concrete rules appear (bounded by the
-  number of pattern rules). Glob results under `$builddir` include outputs of
-  rules instantiated in earlier rounds.
+  rule. Every output contains exactly one `%`; the first explicit input
+  contains exactly one `%` and no glob characters; other inputs contain at most
+  one `%`. Instantiation: replace `%` with `*` in the first explicit input,
+  glob it, and create one concrete rule per match with that stem. Because `*`
+  does not cross `/`, the stem never contains a `/` (unlike make's `%`).
+  Other inputs may contain globs, expanded per instance.
 - Two rules (concrete or instantiated) producing the same output: error naming
   both (§5.8). There is no fallback order between pattern rules.
-- Rule declaration order does not matter for glob resolution: evaluate all
-  statements first, then resolve globs and patterns against the full set of
-  declared outputs.
+- **Evaluation to a fixed point.** Evaluation is a function of the set of
+  declared outputs that globs under `$builddir` see. rmake evaluates the whole
+  build file with the outputs declared by the previous evaluation (initially
+  none) and repeats until that set no longer changes (at most 32 passes; a
+  build that does not converge is an error). If no glob touched `$builddir`,
+  one pass suffices. This makes declaration order irrelevant for globs and
+  resolves chains of pattern rules (`build/%.c from src/%.y`, then
+  `build/%.o from build/%.c`).
 
 ### 5.5 Includes and scoping
 
 - `include sub/Rmakefile`. Paths in an included file (outputs, inputs, globs,
-  nested includes) are relative to that file's directory and rewritten to
-  root-relative.
+  nested includes, `default` and `needs` targets) are relative to that file's
+  directory and rewritten to root-relative. Exceptions: absolute paths, and
+  paths under `$builddir`, which is always root-relative (`$builddir/lib.a`
+  in `sub/Rmakefile` is `build/lib.a`, not `sub/build/lib.a`). Command lines
+  and `depfile` are never rewritten: commands run at the root.
 - `include sub/Makefile` (any file named `Makefile`, `makefile`,
   `GNUmakefile` or ending in `.mk`) runs the importer on it (§10) and includes
   the result.
@@ -354,8 +376,9 @@ narrow the pattern rule's input glob or give `gen.c` its own directory.)
 - Two rules declaring the same output: error naming both.
 - Cycle in the graph: error listing the cycle.
 - Task and file target with the same name: error.
-- Unknown attribute, malformed `%`, `|` outside `from`, unterminated quote,
-  `if` without `end`: error with file:line:col.
+- Unknown or duplicate attribute, malformed `%`, `|` outside `from`,
+  unterminated quote, `if` without `end`, a rule without commands, `depfile`
+  without `deps`, assignment to `os`/`arch`: error with file:line:col.
 - `$in`/`$out`/`$stem` outside a rule, undefined variable, list×list
   concatenation: error with file:line:col.
 - An input that is neither a declared output nor an existing file: error when
@@ -363,8 +386,9 @@ narrow the pattern rule's input glob or give `gen.c` its own directory.)
 
 ### 5.9 Default target
 
-The targets of `default`. Without a `default` statement: the first rule or
-task in the root build file (as in make).
+The targets of `default`. Without a `default` statement: the first output of
+the first non-pattern rule, or the first task, in the root build file (as in
+make, pattern rules never provide the default).
 
 ## 6. Formatting
 
