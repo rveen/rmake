@@ -1,5 +1,8 @@
 # rmake — critical review of the spec and implementation plan
 
+> Current status, decisions taken during implementation and the next steps
+> are in `CLAUDE.md`. The spec is `README.md`.
+
 Input: `README.md` (the `bld` handoff). New requirements: the tool is called
 **rmake**, and it **must import Makefiles**. Guiding principle: *a simple
 language that does not lose the power of make*.
