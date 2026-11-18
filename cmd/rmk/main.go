@@ -1,4 +1,5 @@
-// Command rmake is a content-hash based build tool that can import Makefiles.
+// Command rmk is rmake, a content-hash based build tool that can import
+// Makefiles.
 // See README.md for the specification.
 package main
 
@@ -67,7 +68,7 @@ type options struct {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	var o options
-	fs := flag.NewFlagSet("rmake", flag.ContinueOnError)
+	fs := flag.NewFlagSet("rmk", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.StringVar(&o.dir, "C", "", "change to `dir` first")
 	fs.StringVar(&o.file, "f", "", "build `file` (default: Rmakefile)")
@@ -80,7 +81,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&o.shell, "allow-shell", false, "-t import: run $(shell ...) at import time")
 	fs.BoolVar(&o.check, "check", false, "-t import: compare make -n -B with the imported build")
 	fs.Usage = func() {
-		fmt.Fprintln(stderr, "usage: rmake [flags] [name=value ...] [target|task [args...] ...]")
+		fmt.Fprintln(stderr, "usage: rmk [flags] [name=value ...] [target|task [args...] ...]")
 		fs.PrintDefaults()
 	}
 	// Flags and name=value overrides may be interleaved up to the first
@@ -108,7 +109,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	if o.dir != "" {
 		if err := os.Chdir(o.dir); err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitUsage
 		}
 	}
@@ -123,7 +124,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	file, err := buildFile(o.file)
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	timing := newTimer(stderr)
@@ -158,13 +159,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	g, err := load()
 	timing.mark("load build file")
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	switch o.tool {
 	case "", "why", "query", "clean", "targets", "tasks", "graph":
 	default:
-		fmt.Fprintf(stderr, "rmake: unknown tool %q\n", o.tool)
+		fmt.Fprintf(stderr, "rmk: unknown tool %q\n", o.tool)
 		return exitUsage
 	}
 
@@ -232,10 +233,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		case errors.Is(err, sched.ErrFailed):
 			return exitFailure
 		case errors.Is(err, sched.ErrInterrupted):
-			fmt.Fprintln(stderr, "rmake: interrupted")
+			fmt.Fprintln(stderr, "rmk: interrupted")
 			return exitInterrupted
 		default:
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitFailure
 		}
 	}
@@ -243,7 +244,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// tools, as make does; clean only removes recorded outputs.
 	if len(g.Generated) > 0 && o.tool != "clean" {
 		if err := setup(); err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitFailure
 		}
 		if o.tool != "" {
@@ -256,7 +257,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		timing.mark("generated includes")
 		var le loadError
 		if errors.As(err, &le) {
-			fmt.Fprintln(stderr, "rmake:", le.err)
+			fmt.Fprintln(stderr, "rmk:", le.err)
 			b.Store.Flush()
 			return exitUsage
 		}
@@ -275,7 +276,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return toolTasks(g, stdout)
 	case "graph":
 		if err := g.WriteDOT(stdout, cleanAll(rest)); err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitUsage
 		}
 		return exitOK
@@ -283,7 +284,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	if b == nil {
 		if err := setup(); err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitFailure
 		}
 	}
@@ -296,7 +297,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch o.tool {
 	case "why", "query":
 		if len(rest) != 1 {
-			fmt.Fprintf(stderr, "rmake: -t %s takes one target\n", o.tool)
+			fmt.Fprintf(stderr, "rmk: -t %s takes one target\n", o.tool)
 			return exitUsage
 		}
 		t := path.Clean(rest[0])
@@ -306,29 +307,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 			err = b.Query(stdout, t)
 		}
 		if err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitUsage
 		}
 		return exitOK
 	case "clean":
 		n, err := b.Clean(stdout)
 		if err != nil {
-			fmt.Fprintln(stderr, "rmake:", err)
+			fmt.Fprintln(stderr, "rmk:", err)
 			return exitFailure
 		}
-		fmt.Fprintf(stdout, "rmake: removed %d file(s)\n", n)
+		fmt.Fprintf(stdout, "rmk: removed %d file(s)\n", n)
 		return finish(nil)
 	}
 
 	reqs, err := requests(g, rest)
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	steps, err := g.Plan(reqs, exists)
 	timing.mark("plan")
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	ctx, stop := interrupts()
@@ -336,7 +337,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	stop()
 	timing.mark("build")
 	if err == nil && !b.Worked {
-		fmt.Fprintln(stdout, "rmake: no work to do")
+		fmt.Fprintln(stdout, "rmk: no work to do")
 	}
 	return finish(err)
 }
@@ -489,13 +490,13 @@ func (t *timer) mark(phase string) {
 		return
 	}
 	now := time.Now()
-	fmt.Fprintf(t.w, "rmake: %-16s %6.1f ms\n", phase, float64(now.Sub(t.last).Microseconds())/1000)
+	fmt.Fprintf(t.w, "rmk: %-16s %6.1f ms\n", phase, float64(now.Sub(t.last).Microseconds())/1000)
 	t.last = now
 }
 
 func (t *timer) done() {
 	if t != nil {
-		fmt.Fprintf(t.w, "rmake: %-16s %6.1f ms\n", "total", float64(time.Since(t.start).Microseconds())/1000)
+		fmt.Fprintf(t.w, "rmk: %-16s %6.1f ms\n", "total", float64(time.Since(t.start).Microseconds())/1000)
 	}
 }
 
@@ -564,7 +565,7 @@ func transparent(overrides map[string][]string, goals []string, stderr io.Writer
 					fmt.Fprintf(&b, "\n  %s", n)
 				}
 			}
-			fmt.Fprintf(&b, "\nuse 'rmake -t import %s > Rmakefile' to convert it, then review the result", rel)
+			fmt.Fprintf(&b, "\nuse 'rmk -t import %s > Rmakefile' to convert it, then review the result", rel)
 			return nil, errors.New(b.String())
 		}
 		return res.Source, nil
@@ -586,8 +587,8 @@ func toolImport(o options, overrides map[string][]string, args []string, stdout,
 		return toolImportCheck(file, overrides, args, stdout, stderr)
 	}
 	if file == "" || len(args) > 0 {
-		fmt.Fprintln(stderr, "usage: rmake -t import [-allow-shell] [MAKEFILE]")
-		fmt.Fprintln(stderr, "       rmake -t import -check [MAKEFILE] [GOAL...]")
+		fmt.Fprintln(stderr, "usage: rmk -t import [-allow-shell] [MAKEFILE]")
+		fmt.Fprintln(stderr, "       rmk -t import -check [MAKEFILE] [GOAL...]")
 		return exitUsage
 	}
 	res, err := makefile.Import(makefile.Options{
@@ -595,7 +596,7 @@ func toolImport(o options, overrides map[string][]string, args []string, stdout,
 		AllowShell: o.shell, Stderr: stderr, Fragment: strings.HasSuffix(file, ".mk"),
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	stdout.Write(res.Source)
@@ -603,10 +604,10 @@ func toolImport(o options, overrides map[string][]string, args []string, stdout,
 	for _, n := range res.Notes {
 		if n.Approx {
 			approx++
-			fmt.Fprintln(stderr, "rmake: approximation:", n)
+			fmt.Fprintln(stderr, "rmk: approximation:", n)
 		}
 	}
-	fmt.Fprintf(stderr, "rmake: imported %s: %d note(s), %d approximation(s)\n", file, len(res.Notes), approx)
+	fmt.Fprintf(stderr, "rmk: imported %s: %d note(s), %d approximation(s)\n", file, len(res.Notes), approx)
 	return exitOK
 }
 
@@ -614,12 +615,12 @@ func toolImport(o options, overrides map[string][]string, args []string, stdout,
 // make -n -B and of rmake -n -B on the imported build (README §10.6).
 func toolImportCheck(file string, overrides map[string][]string, goals []string, stdout, stderr io.Writer) int {
 	if file == "" {
-		fmt.Fprintln(stderr, "rmake: no makefile found")
+		fmt.Fprintln(stderr, "rmk: no makefile found")
 		return exitUsage
 	}
 	self, err := os.Executable()
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitFailure
 	}
 	var vars []string
@@ -640,22 +641,22 @@ func toolImportCheck(file string, overrides map[string][]string, goals []string,
 	}
 	mout, err := runOut("make", os.Environ())
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitFailure
 	}
 	// The imported build, approximations included: they are what is
 	// being checked.
 	rout, err := runOut(self, append(os.Environ(), "RMAKE_IMPORT_APPROX=1"))
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitFailure
 	}
 	want, got := makefile.MakeCommands(mout), makefile.RmakeCommands(rout)
 	if diff := makefile.CompareCommands(want, got); diff != "" {
-		fmt.Fprintf(stdout, "rmake: %s: the imported build differs from make:\n%s", file, diff)
+		fmt.Fprintf(stdout, "rmk: %s: the imported build differs from make:\n%s", file, diff)
 		return exitFailure
 	}
-	fmt.Fprintf(stdout, "rmake: %s: the imported build runs the same %d command(s) as make\n", file, len(got))
+	fmt.Fprintf(stdout, "rmk: %s: the imported build runs the same %d command(s) as make\n", file, len(got))
 	return exitOK
 }
 
@@ -726,12 +727,12 @@ func toolFmt(o options, args []string, stdout, stderr io.Writer) int {
 	}
 	src, err := os.ReadFile(file)
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	f, err := syntax.Parse(file, src)
 	if err != nil {
-		fmt.Fprintln(stderr, "rmake:", err)
+		fmt.Fprintln(stderr, "rmk:", err)
 		return exitUsage
 	}
 	stdout.Write(syntax.Format(f))

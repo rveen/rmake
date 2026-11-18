@@ -20,13 +20,16 @@ of the project: read it, then `README.md`, before changing anything.
 | M4 depfiles, `always`, early cutoff, generated includes | done (`c2e7246`) |
 | M5 tasks with params, `needs`, CLI overrides, `-t tasks` | done (`ac23625`) |
 | M6 Makefile importer I (`internal/makefile`, `-t import`, transparent mode) | done (`1ee2b5f`) |
-| M7 importer II: recursive make, delegation, FIFO jobserver, `-t import --check`, `dir` attribute | done (uncommitted until the owner says so) |
+| M7 importer II: recursive make, delegation, FIFO jobserver, `-t import --check`, `dir` attribute | done (`f014710`) |
 | M8 Windows, fd-pair/semaphore jobserver | **deferred by the owner** — Windows is not an objective now |
 | M9 tracing, CAS cache, `tool` attribute | optional; **ask the owner what is next** (see "Possible next steps") |
 
 ## Owner's decisions and working preferences
 
-- Name `rmake`, build file `Rmakefile`; with no `Rmakefile` but a `Makefile`,
+- Name: project `rmake`, command `rmk` (decided 2026-11-18; `mk` and `doo`
+  rejected). Build file `Rmakefile`, state `.rmake/`, `RMAKE_*` variables and
+  the `# rmake:` notes in imported files keep the project name; messages the
+  command prints start with `rmk:`; with no `Rmakefile` but a `Makefile`,
   rmake imports the Makefile (transparent mode). Simplicity of the language without
   losing make's power is the guiding principle; no user functions or macros.
 - Windows is not a goal for now: keep Windows-only code behind build tags
@@ -44,7 +47,7 @@ of the project: read it, then `README.md`, before changing anything.
 ## Architecture
 
 ```
-cmd/rmake            CLI: flags (-C -f -j -k -n -B -v -t), name=value overrides
+cmd/rmk              CLI: flags (-C -f -j -k -n -B -v -t), name=value overrides
                      interleaved with flags, tools, wiring, RMAKE_TIMING
 internal/syntax      lexer (line/word based), parser, AST with positions,
                      canonical printer (Format) used by -t fmt
@@ -76,7 +79,7 @@ internal/sched       Builder: decide (key + reasons); build.go: parallel
                      line; tools.go: Why, Query, Clean
 ```
 
-Flow of a build (`cmd/rmake/main.go`): parse flags → start `state.Open`
+Flow of a build (`cmd/rmk/main.go`): parse flags → start `state.Open`
 in a goroutine → `eval.Load` → if `g.Generated`: `buildIncludes` (build them,
 reload once if changed; also for `-n` and tools except clean) →
 `Hash.Prestat(g.Files())` → `g.Plan(requests,
@@ -165,17 +168,17 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 
 ## Testing and measuring
 
-- `go test ./...`; end-to-end behaviour tests are in `cmd/rmake/build_test.go`,
-  `cmd/rmake/import_test.go` (importer differential tests over
-  `testdata/makefiles/`, see its README; needs GNU make), `cmd/rmake/m6_test.go`
+- `go test ./...`; end-to-end behaviour tests are in `cmd/rmk/build_test.go`,
+  `cmd/rmk/import_test.go` (importer differential tests over
+  `testdata/makefiles/`, see its README; needs GNU make), `cmd/rmk/m6_test.go`
   (transparent C build with real cc, refusal, `-t import`, `include x.mk`),
-  `cmd/rmake/m7_test.go` (jobserver budget with nested makes, recursive
+  `cmd/rmk/m7_test.go` (jobserver budget with nested makes, recursive
   project built with real cc, `-t import -check`),
-  `cmd/rmake/m5_test.go` (tasks, precedence through the real environment),
-  `cmd/rmake/m4_test.go` (depfiles with a fake `cc.sh` and with real `cc`
+  `cmd/rmk/m5_test.go` (tasks, precedence through the real environment),
+  `cmd/rmk/m4_test.go` (depfiles with a fake `cc.sh` and with real `cc`
   when present, `always`, generated includes)
   (rules append to `ran.log` so tests assert exactly which rules ran), and
-  in `cmd/rmake/parallel_test.go` (`-j1` ≡ `-j16`, real parallelism, failure
+  in `cmd/rmk/parallel_test.go` (`-j1` ≡ `-j16`, real parallelism, failure
   without `-k`, SIGINT to a child rmake: `TestMain` makes the test binary act
   as rmake when `RMAKE_TEST_MAIN` is set).
 - Fuzz targets: `syntax.FuzzParse` (parse→format→parse idempotence),

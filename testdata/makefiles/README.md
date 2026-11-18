@@ -1,8 +1,8 @@
 # Importer corpus
 
 Differential test corpus for the Makefile importer (README §10.6), run by
-`TestImportDifferential` in `cmd/rmake/import_test.go`: for every directory,
-`make -n -B GOALS` and `rmake -n -B GOALS` (transparent mode) must print the
+`TestImportDifferential` in `cmd/rmk/import_test.go`: for every directory,
+`make -n -B GOALS` and `rmk -n -B GOALS` (transparent mode) must print the
 same multiset of commands.
 
 - `goals`: one argument list per line (an empty line is the default goal);

@@ -1,6 +1,7 @@
 # rmake — specification
 
-Build file name: `Rmakefile`. If there is no `Rmakefile` but there is a
+The project is rmake; its command is `rmk`. Build file name: `Rmakefile`;
+state directory `.rmake/`. If there is no `Rmakefile` but there is a
 `Makefile`, rmake imports the Makefile in memory and builds from it (§10).
 
 This document specifies a language-neutral build tool written in Go. It
@@ -147,7 +148,7 @@ For `go build`, `cargo build` and similar, two options, both valid:
 - On command failure: delete the rule's outputs, write no record.
 - On SIGINT/SIGTERM: start no new jobs, forward the signal to all running
   process groups, wait, delete outputs of interrupted rules (and write no
-  record for them), flush the state store, print `rmake: interrupted`, exit
+  record for them), flush the state store, print `rmk: interrupted`, exit
   130. A process group still running 2 s after the signal (for instance a
   process that was being forked when it came) is killed with SIGKILL; a
   second SIGINT/SIGTERM kills all running groups at once. Rules that
@@ -248,7 +249,7 @@ concatenation).
   undefined). Top-level definitions are evaluated eagerly, top to bottom.
 - `var x ?= …` sets `x` only if it does not already have a value from the
   command line, the environment, or an earlier definition.
-- Precedence: **command line** (`rmake x=v`) > **environment** (only for
+- Precedence: **command line** (`rmk x=v`) > **environment** (only for
   variables defined with `?=`) > definitions in the file. A command-line value
   makes every `=`, `+=` and `?=` of that name in the file a no-op.
 - The environment is never read implicitly for `=`/`+=` variables.
@@ -447,7 +448,7 @@ make, pattern rules never provide the default).
 
 ## 6. Formatting
 
-`rmake -t fmt [file]` prints a build file in canonical form (two-space
+`rmk -t fmt [file]` prints a build file in canonical form (two-space
 attribute indent, aligned attribute values within a block, one blank line
 between blocks, comments preserved). The same printer produces the output of
 `-t import`. Parse → print → parse must round-trip.
@@ -535,7 +536,7 @@ between blocks, comments preserved). The same printer produces the output of
 ## 9. CLI
 
 ```
-rmake [flags] [name=value ...] [target|task [args...] ...]
+rmk [flags] [name=value ...] [target|task [args...] ...]
 
 flags:
   -C dir        change to dir first
@@ -562,7 +563,7 @@ tools (-t):
                  -check [MAKEFILE] [GOAL...]: compare `make -n -B` with the imported build
 ```
 
-Task arguments are positional: `rmake release 1.4.0`. A task's parameters
+Task arguments are positional: `rmk release 1.4.0`. A task's parameters
 consume exactly that many following arguments, whatever they look like (an
 argument `x=y` after a task is an argument, not an override). The progress
 line shows the task's `desc` expanded with the arguments (`-t tasks` shows it
@@ -583,7 +584,7 @@ Output: one `[n/N] desc` line per rule that runs (`desc`, else the first
 command, shortened to 200 characters), followed by the command's captured
 output (§7.3 for ordering under `-j` and the TTY status line). A failure prints `FAILED: outputs`, the command, its output and the
 exit status. `-n` prints `# outputs: reasons` and the commands of every rule
-that would run. When nothing runs: `rmake: no work to do`.
+that would run. When nothing runs: `rmk: no work to do`.
 
 Diagnostics (environment variables): `RMAKE_TIMING=1` prints the duration of
 each phase to stderr; `RMAKE_CPUPROFILE=file` writes a Go CPU profile.
@@ -592,13 +593,13 @@ each phase to stderr; `RMAKE_CPUPROFILE=file` writes a Go CPU profile.
 
 ### 10.1 Entry points
 
-1. `rmake -t import [-allow-shell] [MAKEFILE] > Rmakefile`: one-time
+1. `rmk -t import [-allow-shell] [MAKEFILE] > Rmakefile`: one-time
    conversion to a readable build file (default: `GNUmakefile`, `makefile` or
    `Makefile`, in make's order). Every note and approximation is listed as a
    `# rmake: file:line: …` comment at the top and the approximations are
    summarized on stderr. `$(shell …)` and `!=` run at import time only with
    `-allow-shell`; otherwise they are an error with file:line.
-2. **Transparent mode**: `rmake` without an `Rmakefile` but with a makefile
+2. **Transparent mode**: `rmk` without an `Rmakefile` but with a makefile
    (or `-f Makefile`, or `include x.mk` from an Rmakefile) imports in memory
    on every run and builds. It follows make: the environment and command-line
    variables are seen at import time, the goals are `$(MAKECMDGOALS)`, and
@@ -736,7 +737,7 @@ definition, followed by rules from implicit rules in the order they were
 needed. Original comments are not carried over (yet).
 
 Variable names keep make's spelling (`CFLAGS`, not `cflags`), so that
-`rmake CFLAGS=-O0` and `CC=clang rmake` work as with make; `.` and `-` become
+`rmk CFLAGS=-O0` and `CC=clang rmk` work as with make; `.` and `-` become
 `_` (`COMPILE.c` → `COMPILE_c`). A name that is still not an rmake name, or
 collides, or is reserved (`os`, `arch`, `builddir`, `in`, `out`, `stem`), is
 expanded instead. Task names may contain `-` and `.` (§5.2).
@@ -756,7 +757,7 @@ or a cycle of recursive makes.
 
 ### 10.6 Verification
 
-Implemented: `rmake -t import -check [MAKEFILE] [GOAL...]` and the
+Implemented: `rmk -t import -check [MAKEFILE] [GOAL...]` and the
 differential test harness (`TestImportDifferential`, corpus in
 `testdata/makefiles/`, see its README), sharing `makefile.MakeCommands`,
 `RmakeCommands` and `CompareCommands`. `-check` runs the imported build with
@@ -768,7 +769,7 @@ creates output directories itself) and prints its recursive `make` commands
 and cannot be compared; delegated sub-makes differ for the same reason.
 
 
-- `rmake -t import --check` runs `make -n -B <goal>` and `rmake -n -B <goal>`
+- `rmk -t import --check` runs `make -n -B <goal>` and `rmk -n -B <goal>`
   on the imported build and compares the multisets of commands (whitespace
   normalized). Differences are reported per command.
 - The same comparison is the importer's test harness, over a corpus in
@@ -787,7 +788,7 @@ and cannot be compared; delegated sub-makes differ for the same reason.
   timestamps (`$?` is all inputs).
 - In a task whose recipe mixes commands and recursive makes, the recursive
   makes (now `needs`) run before all of its commands (a note says so).
-- Sub-makes are concrete: `rmake CFLAGS=-O0` reaches them in transparent mode
+- Sub-makes are concrete: `rmk CFLAGS=-O0` reaches them in transparent mode
   (the import passes command-line variables down, as make does), but in an
   Rmakefile written by `-t import` only the root makefile's variables are
   symbolic.
@@ -795,7 +796,7 @@ and cannot be compared; delegated sub-makes differ for the same reason.
 ## 11. Go project layout
 
 ```
-cmd/rmake/main.go
+cmd/rmk/main.go
 internal/syntax      lexer, parser, AST, positions, printer (= formatter)
 internal/eval        vars, ?=, substitution refs, if, includes, patterns (fixpoint) → graph
 internal/glob        ** globbing, builddir rule
@@ -826,7 +827,7 @@ on M1 and can proceed in parallel with M2–M5.
 | M2 | Serial execution, hashing, hash cache, state store, rebuild decision, `-t why`, `-t query`, `-t clean` | Second build is a no-op; flag change rebuilds; deleted/modified output rebuilds; touch-only runs nothing |
 | M3 | Parallel scheduler, output capture, status line, `-k`, signal handling | Interrupt leaves no partial outputs; `-j1` and `-j16` produce identical results |
 | M4 | Depfiles, `always`, early cutoff, generated includes | Header change rebuilds only affected objects; identical output skips dependents; a generated fragment is built and then used |
-| M5 | Tasks with parameters, `needs`, CLI overrides and precedence, `-t tasks` | `rmake release 1.0` works; tasks never cached |
+| M5 | Tasks with parameters, `needs`, CLI overrides and precedence, `-t tasks` | `rmk release 1.0` works; tasks never cached |
 | M6 | Importer I: make lexer/parser/evaluator, variables, conditionals, includes, explicit/pattern/suffix/static-pattern rules, automatic variables, `.PHONY`, `.d` includes, GNU built-in rules, functions; `-t import`, transparent mode | Differential tests pass for the construct corpus and ≥ 3 real single-directory Makefiles |
 | M7 | Importer II: recursive make → includes, `--allow-shell`, delegation, FIFO jobserver, `-t import --check` | A recursive multi-directory project imports to one graph; nested `make -j` under delegation respects the budget |
 | M8 (deferred) | Windows support, fd-pair and semaphore jobserver | Not scheduled; Windows is not an objective for now |
@@ -855,7 +856,7 @@ on M1 and can proceed in parallel with M2–M5.
   - empty-list vs `""` concatenation;
   - CLI > environment > `?=` precedence;
   - a generated include is built, then used;
-  - imported Makefiles: `make -n -B` ≡ `rmake -n -B`.
+  - imported Makefiles: `make -n -B` ≡ `rmk -n -B`.
 
 ## 14. Open questions
 
@@ -867,4 +868,6 @@ on M1 and can proceed in parallel with M2–M5.
    shows hand-written Rmakefiles need them.
 4. **Remote cache.** Out of scope; keep the state store and output hashing
    compatible with a content-addressed store later.
-5. **Name.** Check `rmake` for collisions before publishing.
+5. **Name.** Decided: the project is rmake, the command `rmk` (short to type;
+   `mk` and `doo` were rejected: Plan 9's mk, slang). The build file, the
+   `.rmake/` directory and the `RMAKE_*` variables keep the project name.

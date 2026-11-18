@@ -64,7 +64,7 @@ func TestTransparentRefusesApproximations(t *testing.T) {
 		"Makefile": "vpath %.c src\nall: x\nx:\n\ttouch $@\n",
 	})
 	code, out, _ := p.build()
-	for _, want := range []string{"Makefile cannot be imported exactly", "Makefile:1:1: vpath is not supported", "rmake -t import Makefile"} {
+	for _, want := range []string{"Makefile cannot be imported exactly", "Makefile:1:1: vpath is not supported", "rmk -t import Makefile"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}

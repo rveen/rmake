@@ -294,7 +294,7 @@ func (r *run) decide(i int) {
 	if t := n.step.Task; t != nil {
 		run, err := t.Expand(n.step.Args)
 		if err != nil {
-			r.prog.message(fmt.Sprintf("FAILED: task %s\nrmake: %s: %v\n", t.Name, t.Pos, err))
+			r.prog.message(fmt.Sprintf("FAILED: task %s\nrmk: %s: %v\n", t.Name, t.Pos, err))
 			r.fail(i)
 			return
 		}
@@ -314,7 +314,7 @@ func (r *run) decide(i int) {
 	rule := n.step.Rule
 	d, err := b.decide(rule, r.pending)
 	if err != nil {
-		r.prog.message(fmt.Sprintf("FAILED: %s\nrmake: %s: %v\n", strings.Join(rule.Outs, " "), rule.Pos, err))
+		r.prog.message(fmt.Sprintf("FAILED: %s\nrmk: %s: %v\n", strings.Join(rule.Outs, " "), rule.Pos, err))
 		r.fail(i)
 		return
 	}
@@ -388,7 +388,7 @@ func (b *Builder) work(ctx context.Context, j *job) {
 	if j.rule != nil {
 		for _, o := range j.rule.Outs {
 			if err := os.MkdirAll(filepath.Dir(b.abs(o)), 0o755); err != nil {
-				fmt.Fprintf(&j.out, "FAILED: %s\nrmake: %v\n", j.what, err)
+				fmt.Fprintf(&j.out, "FAILED: %s\nrmk: %v\n", j.what, err)
 				j.err = ErrFailed
 				return
 			}
@@ -401,7 +401,7 @@ func (b *Builder) work(ctx context.Context, j *job) {
 		// Read and delete the depfile, whatever the outcome.
 		deps, err := readDepfile(b.abs(j.rule.Depfile))
 		if err != nil && j.err == nil {
-			fmt.Fprintf(&j.out, "FAILED: %s\nrmake: %s: %v\n", j.what, j.rule.Pos, err)
+			fmt.Fprintf(&j.out, "FAILED: %s\nrmk: %s: %v\n", j.what, j.rule.Pos, err)
 			j.err = ErrFailed
 		}
 		j.deps = deps
@@ -412,7 +412,7 @@ func (b *Builder) work(ctx context.Context, j *job) {
 	for _, o := range j.rule.Outs {
 		e, err := b.Hash.Compute(o)
 		if err != nil {
-			fmt.Fprintf(&j.out, "FAILED: %s\nrmake: hashing %s: %v\n", j.what, o, err)
+			fmt.Fprintf(&j.out, "FAILED: %s\nrmk: hashing %s: %v\n", j.what, o, err)
 			j.err = ErrFailed
 			return
 		}
@@ -443,7 +443,7 @@ func (b *Builder) runCmds(ctx context.Context, j *job) error {
 					j.out.WriteByte('\n')
 				}
 			}
-			fmt.Fprintf(&j.out, "rmake: %s: %v\n", c.Pos, err)
+			fmt.Fprintf(&j.out, "rmk: %s: %v\n", c.Pos, err)
 			return ErrFailed
 		}
 		j.out.Write(res.Output)
@@ -485,7 +485,7 @@ func (r *run) complete(j *job) {
 			for o := range outHashes {
 				b.Hash.Forget(o)
 			}
-			fmt.Fprintf(&j.out, "FAILED: %s\nrmake: %s: the commands did not create %s\n", j.what, rule.Pos, e.Path())
+			fmt.Fprintf(&j.out, "FAILED: %s\nrmk: %s: the commands did not create %s\n", j.what, rule.Pos, e.Path())
 			discard()
 			r.prog.finish(j.n, j.desc, j.out.Bytes())
 			r.fail(j.idx)

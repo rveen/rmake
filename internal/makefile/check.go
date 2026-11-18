@@ -45,7 +45,7 @@ var ignoreErrors = regexp.MustCompile(`^\((.*)\) \|\| true$`)
 func RmakeCommands(out string) []string {
 	var cmds []string
 	for _, l := range strings.Split(out, "\n") {
-		if l == "" || strings.HasPrefix(l, "# ") || strings.HasPrefix(l, "rmake: ") {
+		if l == "" || strings.HasPrefix(l, "# ") || strings.HasPrefix(l, "rmk: ") {
 			continue
 		}
 		c := normCmd(l)

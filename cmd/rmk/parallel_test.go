@@ -178,7 +178,7 @@ rule b.txt from
 	if p.exists("a.txt") || p.exists("b.txt") {
 		t.Errorf("interrupted rules left partial outputs")
 	}
-	if !strings.Contains(out.String(), "rmake: interrupted") {
+	if !strings.Contains(out.String(), "rmk: interrupted") {
 		t.Errorf("output:\n%s", out.String())
 	}
 	// The state was flushed and is usable; the rules run again.
