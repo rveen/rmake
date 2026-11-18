@@ -89,6 +89,7 @@ task test needs $builddir/app$exe bin/server
   run  go test ./...
 
 task release(version) needs test
+  desc "tag release $version"
   run git tag v$version
 `
 
@@ -109,11 +110,13 @@ func TestExample(t *testing.T) {
 		t.Error("bin/server not always")
 	}
 	rel := g.Tasks["release"]
-	c, _, err := rel.Expand([]string{"1.4.0"})
+	c, _, desc, err := rel.Expand([]string{"1.4.0"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	eq(t, "release", c[0].String(), "git tag v1.4.0")
+	eq(t, "release desc", desc, "tag release 1.4.0")
+	eq(t, "listed desc", rel.Desc, "tag release <version>")
 	eq(t, "test needs", g.Tasks["test"].Needs, []string{"build/app", "bin/server"})
 
 	// On windows, exe is .exe.
@@ -196,6 +199,9 @@ func TestErrors(t *testing.T) {
 		{"include nope\n", "include nope: no such file"},
 		{"include Rmakefile\n", "include cycle: Rmakefile -> Rmakefile"},
 		{"task t\n  run echo $nope\n", "Rmakefile:2:12: undefined variable nope"},
+		{"task t(os)\n  run echo\n", "Rmakefile:1:1: task t: parameter os would hide the built-in variable"},
+		{"task t(in)\n  run echo\n", "parameter in would hide"},
+		{"task t(a, b, a)\n  run echo\n", "Rmakefile:1:1: task t: duplicate parameter a"},
 		{"var builddir = ../x\n", "builddir must be a relative directory"},
 	}
 	for _, tt := range tests {
@@ -309,7 +315,7 @@ task t
 var v = late
 `
 	g := load(t, map[string]string{"Rmakefile": src}, Options{})
-	c, _, err := g.Tasks["t"].Expand(nil)
+	c, _, _, err := g.Tasks["t"].Expand(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

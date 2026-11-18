@@ -660,35 +660,50 @@ func (p *pass) task(t *syntax.Task, sc *scope, ctx *fileCtx) error {
 	}
 	snap := sc.snapshot()
 	params := t.Params
-	expand := func(args []string) (*scope, []graph.Cmd, map[string]string, error) {
+	seen := map[string]bool{}
+	for _, name := range params {
+		switch {
+		case name == "os" || name == "arch" || name == "builddir" || name == "in" || name == "out" || name == "stem":
+			return syntax.Errorf(t.Pos, "task %s: parameter %s would hide the built-in variable", t.Name, name)
+		case seen[name]:
+			return syntax.Errorf(t.Pos, "task %s: duplicate parameter %s", t.Name, name)
+		}
+		seen[name] = true
+	}
+	expand := func(args []string) ([]graph.Cmd, map[string]string, string, error) {
 		ts := newScope(snap)
 		for i, name := range params {
 			ts.vars[name] = []string{args[i]}
 		}
 		cmds, env, err := p.attrs(t.Attrs, ts, ctx, nil)
-		return ts, cmds, env, err
+		if err != nil {
+			return nil, nil, "", err
+		}
+		desc := ""
+		for _, a := range t.Attrs {
+			if a.Kind == "desc" {
+				if desc, err = expandJoined(a.Args, ts); err != nil {
+					return nil, nil, "", err
+				}
+			}
+		}
+		return cmds, env, desc, nil
 	}
 	// Check the task now, with placeholder arguments.
 	ph := make([]string, len(params))
 	for i, name := range params {
 		ph[i] = "<" + name + ">"
 	}
-	ts, _, _, err := expand(ph)
+	_, _, desc, err := expand(ph)
 	if err != nil {
 		return err
 	}
-	gt := &graph.Task{Pos: t.Pos, Name: t.Name, Params: params}
-	for _, a := range t.Attrs {
-		if a.Kind == "desc" {
-			gt.Desc, _ = expandJoined(a.Args, ts)
-		}
-	}
-	gt.Expand = func(args []string) ([]graph.Cmd, map[string]string, error) {
+	gt := &graph.Task{Pos: t.Pos, Name: t.Name, Params: params, Desc: desc}
+	gt.Expand = func(args []string) ([]graph.Cmd, map[string]string, string, error) {
 		if len(args) != len(params) {
-			return nil, nil, fmt.Errorf("task %s takes %d argument(s), got %d", t.Name, len(params), len(args))
+			return nil, nil, "", fmt.Errorf("task %s takes %d argument(s), got %d", t.Name, len(params), len(args))
 		}
-		_, cmds, env, err := expand(args)
-		return cmds, env, err
+		return expand(args)
 	}
 	if err := p.g.AddTask(gt); err != nil {
 		return err

@@ -74,10 +74,10 @@ type Task struct {
 	Name   string
 	Params []string
 	Needs  []string // task names or root-relative file paths
-	Desc   string
-	// Expand returns the commands and pass'ed variables for the given
-	// arguments (one per parameter).
-	Expand func(args []string) ([]Cmd, map[string]string, error)
+	Desc   string   // with placeholder arguments (<param>) for parameters
+	// Expand returns the commands, the pass'ed variables and the desc ("" if
+	// none) for the given arguments (one per parameter).
+	Expand func(args []string) (cmds []Cmd, env map[string]string, desc string, err error)
 }
 
 // Graph is the whole build.

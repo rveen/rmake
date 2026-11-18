@@ -17,9 +17,9 @@ of the project: read it, then `README.md`, before changing anything.
 | M1 parser, printer, eval, graph, `-n`, `-t graph/targets/tasks/fmt` | done (`ed2cd70`) |
 | M2 serial execution, hashing, state store, rebuild decision, `-t why/query/clean` | done (`fea7752`) |
 | M3 parallel scheduler, output capture, status line, `-k`, signals | done (`93d074e`) |
-| M4 depfiles, `always`, early cutoff, generated includes | done (uncommitted until the owner says so) |
-| **M5** tasks with params, `needs`, CLI overrides, `-t tasks` | **next**: mostly done already; verify against README §12 and close |
-| M6–M7 Makefile importer (`internal/makefile`, `-t import`, transparent mode) | todo; depends only on M1 |
+| M4 depfiles, `always`, early cutoff, generated includes | done (`c2e7246`) |
+| M5 tasks with params, `needs`, CLI overrides, `-t tasks` | done (uncommitted until the owner says so) |
+| **M6**–M7 Makefile importer (`internal/makefile`, `-t import`, transparent mode) | **next** (M6); depends only on M1 |
 | M8 Windows, fd-pair/semaphore jobserver | **deferred by the owner** — Windows is not an objective now |
 | M9 tracing, CAS cache, `tool` attribute | optional |
 
@@ -105,6 +105,9 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   the rest with `Hash.Hash` (missing → `missingHash`) and recomputes the key
   with the new discovered set before `PutRule`. `decide` uses the previous
   record's discovered set, so the two keys match on a no-op.
+- **Tasks**: `Task.Expand(args)` returns commands, pass'ed env and the desc
+  expanded with the arguments; `Task.Desc` keeps the `<param>` placeholder
+  form for `-t tasks`. Tasks are ordered only by `needs` (parallel under -j).
 - **Generated includes**: `eval` reads a missing include as empty and
   `pass.finish` resolves `g.Generated` (includes that are rule outputs) or
   errors for a missing include nobody produces. `Builder.Build` no longer
@@ -119,6 +122,7 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
 ## Testing and measuring
 
 - `go test ./...`; end-to-end behaviour tests are in `cmd/rmake/build_test.go`,
+  `cmd/rmake/m5_test.go` (tasks, precedence through the real environment),
   `cmd/rmake/m4_test.go` (depfiles with a fake `cc.sh` and with real `cc`
   when present, `always`, generated includes)
   (rules append to `ran.log` so tests assert exactly which rules ran), and
@@ -155,15 +159,18 @@ with an `execx.Interrupt` cause) → `Store.Flush` → exit 0/1/130.
   not print "no work to do" even if the dry run itself lists nothing.
 - Variables defined in a generated fragment are local to it (README §5.5),
   so fragments contribute rules and tasks, not settings for the parent.
-- Task `desc` is computed with placeholder arguments; for tasks with
-  parameters the progress line falls back to `task NAME ARGS`. Better: have
-  `Task.Expand` return the expanded desc.
 - The README §5.7 example deliberately contains a duplicate-output case
   (`src/gen.c`), explained under the example; the tests use a copy without it.
 
-## Plan for M5 (next)
+## Plan for M6 (next)
 
-Most of M5 exists (tasks with parameters, `needs`, overrides, `-t tasks`).
-Verify against README §5 / §9 / §12 ("`rmake release 1.0` works; tasks never
-cached", CLI > environment > `?=` precedence test from §13), fill gaps, and
-fix the task `desc` loose end above (expand desc with the arguments).
+Makefile importer I (README §10, PLAN.md §5–6): new package
+`internal/makefile` (make lexer/parser/evaluator: variables, conditionals,
+includes, explicit/pattern/suffix/static-pattern rules, automatic variables,
+`.PHONY` → task, `-include *.d` → `deps gcc`, GNU built-in rules, common
+functions), emitting `syntax` AST so `syntax.Format` prints it. Wire up
+`-t import`, `include x.mk`/`Makefile` (eval.include currently errors) and
+transparent mode (`buildFile` in main: no Rmakefile but a Makefile).
+Acceptance: differential tests (`make -n -B` ≡ `rmake -n -B`) for a
+construct corpus and ≥ 3 real single-directory Makefiles; skip if `make` is
+absent. Large milestone: agree a scope cut with the owner first.

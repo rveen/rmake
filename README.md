@@ -272,7 +272,10 @@ first rule or include).
 
 - Inside rules: `$in` (explicit inputs, in declaration order; glob results
   sorted), `$out` (all outputs), `$stem` (the `%` match in pattern rules).
-- Inside tasks: parameters are variables (`$version`).
+- Inside tasks: parameters are variables (`$version`), each one word: the
+  argument, taken literally (never expanded). A parameter may not be named
+  like a built-in (`os`, `arch`, `builddir`, `in`, `out`, `stem`), and
+  parameter names must differ.
 - Rule- and task-local `var` lines see top-level variables and `$in`, `$out`,
   `$stem`, and shadow top-level variables for that rule only. They are
   evaluated in order **before** the rule's other attributes, wherever they
@@ -395,6 +398,7 @@ task test needs $builddir/app$exe bin/server
   run  go test ./...
 
 task release(version) needs test
+  desc "tag release $version"
   run  git tag v$version
 ```
 
@@ -530,7 +534,17 @@ tools (-t):
 ```
 
 Task arguments are positional: `rmake release 1.4.0`. A task's parameters
-consume exactly that many following arguments.
+consume exactly that many following arguments, whatever they look like (an
+argument `x=y` after a task is an argument, not an override). The progress
+line shows the task's `desc` expanded with the arguments (`-t tasks` shows it
+with `<param>` placeholders), else `task NAME ARGS`.
+
+The same task with the same arguments runs once per invocation of rmake, even
+if requested or needed several times. A task needed by another task may not
+take parameters. Tasks are ordered only by `needs`: tasks and targets
+requested together on the command line run in parallel under `-j`, as in
+make. When `b` must run after `a`, declare `task b needs a` (or use `-j1`,
+which runs requests in command-line order).
 
 Tools use `-t` (as in Ninja) so tool names never collide with target or task names.
 

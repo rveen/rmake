@@ -41,6 +41,7 @@ type node struct {
 	d    decision          // rules
 	cmds []graph.Cmd       // tasks: expanded commands
 	env  map[string]string // tasks: pass'ed variables
+	desc string            // tasks: expanded desc
 }
 
 // job is one step running in a worker.
@@ -241,7 +242,7 @@ func (r *run) decide(i int) {
 		return
 	}
 	if t := n.step.Task; t != nil {
-		cmds, env, err := t.Expand(n.step.Args)
+		cmds, env, desc, err := t.Expand(n.step.Args)
 		if err != nil {
 			r.prog.message(fmt.Sprintf("FAILED: task %s\nrmake: %s: %v\n", t.Name, t.Pos, err))
 			r.fail(i)
@@ -256,7 +257,7 @@ func (r *run) decide(i int) {
 			r.finish(i, true)
 			return
 		}
-		n.cmds, n.env = cmds, env
+		n.cmds, n.env, n.desc = cmds, env, desc
 		heap.Push(&r.runnable, i)
 		return
 	}
@@ -302,10 +303,7 @@ func (r *run) start(i int) *job {
 		j.what = "task " + name
 		j.cmds = n.cmds
 		j.env = execx.Env(b.BaseEnv, n.env)
-		j.desc = t.Desc
-		if j.desc != "" && len(t.Params) > 0 {
-			j.desc = "" // the stored desc has placeholder arguments
-		}
+		j.desc = n.desc
 		if j.desc == "" {
 			j.desc = j.what
 		}
